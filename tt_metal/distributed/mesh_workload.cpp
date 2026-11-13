@@ -1091,13 +1091,15 @@ const Program& program_at(
 
 }  // namespace
 
-void UpdateProgramRunArgsForDevice(
-    distributed::MeshWorkload& workload,
-    const distributed::MeshCoordinateRange& program_range,
-    const distributed::MeshCoordinate& device,
-    const ProgramRunArgs& values) {
-    const auto resolved = resolve_named_args(program_at(workload, program_range, device), values);
-    auto& impl = workload.impl();
+}  // namespace tt::tt_metal::experimental
+
+namespace tt::tt_metal::distributed {
+
+void MeshWorkload::update_run_args_for_device(
+    const MeshCoordinateRange& program_range, const MeshCoordinate& device, const ProgramRunArgs& values) {
+    const auto resolved =
+        experimental::resolve_named_args(experimental::program_at(*this, program_range, device), values);
+    auto& impl = this->impl();
     // All or nothing: check every arg first, so setting them cannot fail half-way.
     for (const auto& words : resolved) {
         (void)impl.find_per_device_runtime_args_field(
@@ -1115,6 +1117,10 @@ void UpdateProgramRunArgsForDevice(
             program_range, device, words.kernel, words.core, words.first_word, words.values);
     }
 }
+
+}  // namespace tt::tt_metal::distributed
+
+namespace tt::tt_metal::experimental {
 
 void SetRuntimeArgsForDevice(
     distributed::MeshWorkload& mesh_workload,
