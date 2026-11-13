@@ -10,7 +10,7 @@
 //   enqueue rebuilds the per-device command images (what reset=1 cost before same values were detected).
 // - ProgramPerDevice: the pattern per-device runtime args replace, one program per device.
 // - Metal2/...: a Metal 2.0 program on the mesh with 30 named common run args; every iteration calls
-//   UpdateProgramRunArgs first. mode=0: no per-device values, update "address". mode=1: the 30 args have per-device
+//   Program::update_run_args first. mode=0: no per-device values, update "address". mode=1: the 30 args have per-device
 //   values, update "address" (no drop). mode=2: update the 30 args (dropping their per-device values), then set the
 //   same per-device values again on every device. mode=3: only set the same per-device values again (no update).
 // Each iteration enqueues the workload once (non-blocking); the queue is drained outside the timed region.

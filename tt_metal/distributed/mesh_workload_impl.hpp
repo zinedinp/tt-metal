@@ -227,7 +227,7 @@ public:
         const std::optional<CoreCoord>& core,
         uint32_t first_word);
     // Metal 2.0 (ProgramSpec) programs: the words of named run args, resolved by
-    // experimental::UpdateProgramRunArgsForDevice. Same semantics as the legacy setter.
+    // MeshWorkload::update_run_args_for_device. Same semantics as the legacy setter.
     void set_per_device_named_runtime_args(
         const MeshCoordinateRange& program_range,
         const MeshCoordinate& device,
@@ -247,8 +247,8 @@ public:
     bool has_per_device_runtime_args() const { return !per_device_runtime_args_.empty(); }
     // The per-device runtime args of the program at `program_range`, or null; fails if the program there is not the
     // one they were set for. Every enqueue / capture path reads them through this, which first brings them up to
-    // date: applies the program's pending drops (Metal 2.0 SetProgramRunArgs / UpdateProgramRunArgs), removes fields
-    // no device has a value of, and bumps values_version only if the values differ from the last commit.
+    // date: applies the program's pending drops (Metal 2.0 Program::set_run_args / Program::update_run_args), removes
+    // fields no device has a value of, and bumps values_version only if the values differ from the last commit.
     const PerDeviceRuntimeArgs* per_device_runtime_args(const MeshCoordinateRange& program_range);
     // Applies the pending drops of the program at `program_range` to its per-device args (Metal 2.0 programs).
     void apply_per_device_run_arg_drops(const MeshCoordinateRange& program_range);
