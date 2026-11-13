@@ -23,7 +23,6 @@
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/mesh_workload.hpp>
-#include <tt-metalium/experimental/metal2_host_api/program.hpp>
 #include <tt-metalium/workload/run_args/program_run_args.hpp>
 #include <tt-metalium/workload/specification/program_spec.hpp>
 
@@ -124,7 +123,6 @@ void BM_OneProgram(benchmark::State& state) {
 }
 
 namespace m2 = tt::tt_metal;
-namespace m2x = tt::tt_metal::experimental;
 constexpr uint32_t kMetal2Args = 30;
 constexpr char kMetal2Kernel[] = "writer";
 
@@ -164,10 +162,10 @@ void kernel_main() {
         .kernels = {kernel},
         .work_units = {m2::test_helpers::MakeMinimalWorkUnit("main", m2::NodeCoord{0, 0}, {kMetal2Kernel})},
     };
-    auto workload = m2x::MakeMeshWorkloadFromSpec(mesh_device(), spec);
+    MeshWorkload workload(mesh_device(), spec);
     const MeshCoordinateRange range(mesh_device().shape());
     auto& program = workload.get_programs().at(range);
-    m2x::SetProgramRunArgs(program, metal2_args(true, true, 0));
+    program.set_run_args(metal2_args(true, true, 0));
     std::vector<m2::ProgramRunArgs> per_device_args;
     for (uint32_t index = 1; index <= range.shape().mesh_size(); index++) {
         per_device_args.push_back(metal2_args(false, true, 1000 * index));
@@ -175,7 +173,7 @@ void kernel_main() {
     auto set_per_device = [&] {
         uint32_t index = 0;
         for (const auto& coord : range) {
-            m2x::UpdateProgramRunArgsForDevice(workload, range, coord, per_device_args[index++]);
+            workload.update_run_args_for_device(range, coord, per_device_args[index++]);
         }
     };
     if (mode != 0) {
@@ -187,11 +185,11 @@ void kernel_main() {
         run(state, workload, set_per_device);
     } else if (mode == 2) {
         run(state, workload, [&] {
-            m2x::UpdateProgramRunArgs(program, update_values, /*skip_validation=*/true);
+            program.update_run_args(update_values, /*skip_validation=*/true);
             set_per_device();
         });
     } else {
-        run(state, workload, [&] { m2x::UpdateProgramRunArgs(program, update_address, /*skip_validation=*/true); });
+        run(state, workload, [&] { program.update_run_args(update_address, /*skip_validation=*/true); });
     }
 }
 
