@@ -1289,7 +1289,10 @@ class TtPrefillRuntime:
             ttnn.deallocate(input_tensor)
         if metadata_msg is not None and metadata_msg is not self._trace_metadata_msg:
             ttnn.copy(metadata_msg, self._trace_metadata_msg)
-        if indexer_indices is not None:
+        # A claimed top-k (claim_persistent_extras) is the persistent seed itself, which the drain filled.
+        if indexer_indices is not None and not (
+            self._extras_are_caller_filled and _same_buffer(indexer_indices, self._trace_indices_in)
+        ):
             ttnn.copy(indexer_indices, self._trace_indices_in)
             ttnn.deallocate(indexer_indices)
         scratch = (cfg.num_users, 0, cfg.chunk_size)
@@ -1564,7 +1567,7 @@ class TtPrefillRuntime:
     ) -> Optional[ttnn.Tensor]:
         """Prefill ONE packed forward of ``forward_chunks`` ``chunks`` (PrefillChunk) into the engine-owned
         ``kv_caches``. Each layer runs attention once per non-empty chunk against its slot_id at its
-        actual_start, then ffn_norm + MoE once over every chunk's rows (the model's forward_packed).
+        actual_start, then ffn_norm + MoE once over every chunk's rows (TtPrefillTransformer.forward_packed).
 
         Chunk rules are MiniMax-M3's (validate_chunks): a slot's chunks are one run of consecutive chunks,
         only the run's last may be partial, empties only at the tail.
