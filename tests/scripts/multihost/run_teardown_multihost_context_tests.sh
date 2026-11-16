@@ -45,16 +45,17 @@ VICTIM=1 # rank 1, on the second host (remote)
 MPI_ARGS="--allow-run-as-root --oversubscribe --mca btl self,tcp"
 FAIL=0
 
-# tt-run in new mode: phase 1 solves the mock quad descriptor across --hosts, then launches the probe one rank
-# per host. No PRRTE --timeout here on purpose: the hang case must be bounded by the context's own timeout, not
-# the launcher wall clock.
+# tt-run in LEGACY mode (--rank-binding + --mock-cluster-rank-binding), the same mock the single-host rows use.
+# A mock cluster and --hosts are mutually exclusive in tt-run (--hosts is a real-cluster phase-1 solve; a mock
+# replaces it), so the two ranks are placed on the two real hosts through the mpirun line (--host ... --map-by
+# node), not through --hosts. No PRRTE --timeout on purpose: the hang case must be bounded by the context's own
+# timeout, not the launcher wall clock. One rank per host so rank 1 is genuinely remote.
+BINDING="$ROOT/tests/tt_metal/distributed/config/dual_bh_galaxy_rank_binding.yaml"
 run_probe() { # extra "KEY=VAL ..." env
   env "$@" timeout 180 "$TTRUN" \
-    --hosts "$HOSTS" \
-    --mesh-graph-descriptor "$MGD" \
+    --rank-binding "$BINDING" \
     --mock-cluster-rank-binding "$MAPPING" \
-    --mpi-args "$MPI_ARGS" \
-    --force-rediscovery \
+    --mpi-args "$MPI_ARGS --host $HOSTS --map-by node" \
     "$PY" "$PROBE"
 }
 
