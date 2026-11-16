@@ -643,12 +643,14 @@ class MiniMaxH3Pipeline:
         dynamic_length: bool | None = None,
         max_sequence_length: int | None = None,
         agmm_mode: AgmmMode | str | None = None,
+        adaln_once_per_denoise: bool = True,
     ) -> None:
         """`dynamic_length` serves every packed length up to `max_sequence_length` with one program set per
         length class (eager only). It is the 4x8 presets' default on both architectures; `_resolve_denoise_path` has
         the precedence (kwarg > MINIMAX_H3_DYNAMIC_LENGTH > preset) and how the bucketed kwargs keep that path.
         `agmm_mode` (`accurate` / `balanced`; kwarg > MINIMAX_H3_AGMM_MODE > `balanced`) picks that path's
-        all-gather matmul pins."""
+        all-gather matmul pins. `adaln_once_per_denoise` projects every step's adaLN tables once at the start of an
+        untraced denoise instead of once a step."""
         self.mesh_device = mesh_device
         self.weights_dir = Path(weights_dir)
         self.video_shift = VIDEO_SHIFT if video_shift is None else float(video_shift)
@@ -680,6 +682,7 @@ class MiniMaxH3Pipeline:
         self.bucket_denoise = path.bucket_denoise
         self.dynamic_length = path.dynamic_length
         self.agmm_mode = resolve_agmm_mode(agmm_mode)
+        self.adaln_once_per_denoise = adaln_once_per_denoise
         self.dit_fsdp, fsdp_source = _resolve_dit_fsdp(
             preset, dit_fsdp=dit_fsdp, task=task, dynamic_length=self.dynamic_length
         )
@@ -932,6 +935,7 @@ class MiniMaxH3Pipeline:
         dynamic_length: bool | None = None,
         max_sequence_length: int | None = None,
         agmm_mode: AgmmMode | str | None = None,
+        adaln_once_per_denoise: bool = True,
         **subclass_kwargs,
     ) -> "MiniMaxH3Pipeline":
         """`task="t2va"` serves both t2va and fl2va; `task="ref2va"` loads `transformer_ref/`.
@@ -945,7 +949,8 @@ class MiniMaxH3Pipeline:
         padded length up to `max_sequence_length`; passing any bucketed kwarg instead keeps that path. `dit_fsdp`
         (MINIMAX_H3_DIT_FSDP=0|1 > kwarg > preset) is on by default for dynamic-length ref2va, see `_resolve_dit_fsdp`.
         `agmm_mode` (`accurate` / `balanced`; kwarg > MINIMAX_H3_AGMM_MODE > `balanced`) picks the dynamic-length
-        path's all-gather matmul pins.
+        path's all-gather matmul pins. `adaln_once_per_denoise` (default on) projects the adaLN tables once an
+        untraced denoise instead of once a step.
         """
         transformer_subfolder = "transformer_ref" if task == "ref2va" else "transformer"
         weights_dir = resolve_weights_dir(
@@ -981,6 +986,7 @@ class MiniMaxH3Pipeline:
             dynamic_length=dynamic_length,
             max_sequence_length=max_sequence_length,
             agmm_mode=agmm_mode,
+            adaln_once_per_denoise=adaln_once_per_denoise,
             **subclass_kwargs,
         )
 
@@ -3164,7 +3170,7 @@ class MiniMaxH3Pipeline:
         # each forward then picks its step's rows by an embedding lookup. The stacked rows are padded to a multiple
         # of ADALN_PREPARED_ROWS so the programs do not depend on the step count (the warmup compiles them). The
         # prepared table lives for one request, so traced runs keep the per-step projection.
-        precompute_modulation = not traced and os.environ.get("MINIMAX_H3_ADALN_PRECOMPUTE", "1") != "0"
+        precompute_modulation = not traced and self.adaln_once_per_denoise
         if precompute_modulation:
             levels = [step_levels(i) for i in range(len(timesteps))]
             num_slots = levels[0][0].numel()
@@ -3196,61 +3202,62 @@ class MiniMaxH3Pipeline:
             else nullcontext()
         )
         with transient:
-            for i, t in enumerate(
-                tqdm.tqdm(
-                    timesteps,
-                    desc="Denoising",
-                    disable=(not _is_host_rank()),
-                    file=sys.stderr,
-                    bar_format=_TQDM_BAR_FORMAT,
-                )
-            ):
-                t_step = time.time()
-                try:
-                    video_velocity, audio_velocity = transformer(
-                        video_1BVC=self._tt_video.value,
-                        audio_1BAC=self._tt_audio.value,
-                        assembly_indices=state.assembly_idx.value,
-                        video_out_indices=self._tt_video_out_idx.value,
-                        audio_out_indices=self._tt_audio_out_idx.value,
-                        timestep=self._tt_timestep.value,
-                        adaln_indices=state.adaln.value,
-                        timestep_indices=state.tsi.value,
-                        rope_cos=state.rope_cos.value,
-                        rope_sin=state.rope_sin.value,
-                        logical_n=self._tt_logical_n.value,
-                        pad_to=rung,
-                        traced=traced,
-                        **tilerow_kwargs,
-                        **({} if endpoints is None else {"endpoint_timestep": self._tt_endpoint_timestep.value}),
-                        **(modulation_rows(i) if precompute_modulation else {}),
+            try:
+                for i, t in enumerate(
+                    tqdm.tqdm(
+                        timesteps,
+                        desc="Denoising",
+                        disable=(not _is_host_rank()),
+                        file=sys.stderr,
+                        bar_format=_TQDM_BAR_FORMAT,
                     )
-                except RuntimeError as err:
-                    if "Out of Memory" in str(err):
-                        # The forward's locals are gone by now; this is the resident set that remains.
-                        dram_probe.report(f"after OOM in step {i + 1}, rung {rung} (forward unwound)")
-                    raise
+                ):
+                    t_step = time.time()
+                    try:
+                        video_velocity, audio_velocity = transformer(
+                            video_1BVC=self._tt_video.value,
+                            audio_1BAC=self._tt_audio.value,
+                            assembly_indices=state.assembly_idx.value,
+                            video_out_indices=self._tt_video_out_idx.value,
+                            audio_out_indices=self._tt_audio_out_idx.value,
+                            timestep=self._tt_timestep.value,
+                            adaln_indices=state.adaln.value,
+                            timestep_indices=state.tsi.value,
+                            rope_cos=state.rope_cos.value,
+                            rope_sin=state.rope_sin.value,
+                            logical_n=self._tt_logical_n.value,
+                            pad_to=rung,
+                            traced=traced,
+                            **tilerow_kwargs,
+                            **({} if endpoints is None else {"endpoint_timestep": self._tt_endpoint_timestep.value}),
+                            **(modulation_rows(i) if precompute_modulation else {}),
+                        )
+                    except RuntimeError as err:
+                        if "Out of Memory" in str(err):
+                            # The forward's locals are gone by now; this is the resident set that remains.
+                            dram_probe.report(f"after OOM in step {i + 1}, rung {rung} (forward unwound)")
+                        raise
 
-                ttnn.multiply_(video_velocity, float(scheduler.step_coefficient(i)))
-                ttnn.add_(self._tt_video.value, video_velocity)
-                ttnn.multiply_(audio_velocity, float(audio_scheduler.step_coefficient(i)))
-                ttnn.add_(self._tt_audio.value, audio_velocity)
-                if i + 1 < len(timesteps):
-                    upload_levels(step_levels(i + 1))
-                ttnn.synchronize_device(self.mesh_device)
-                if ttnn.using_distributed_env():
-                    ttnn.distributed_context_barrier()
-                if i == 0:
-                    dram_probe.report(f"after step 1, rung {rung}")
-                t_step = time.time() - t_step
-                if i == 0:
-                    t_first = t_step
-                else:
-                    t_steady += t_step
-                on_event(DenoiseStep(step=i + 1, total=len(timesteps), sigma=float(t)))
-
-            if precompute_modulation:
-                transformer.release_modulation()
+                    ttnn.multiply_(video_velocity, float(scheduler.step_coefficient(i)))
+                    ttnn.add_(self._tt_video.value, video_velocity)
+                    ttnn.multiply_(audio_velocity, float(audio_scheduler.step_coefficient(i)))
+                    ttnn.add_(self._tt_audio.value, audio_velocity)
+                    if i + 1 < len(timesteps):
+                        upload_levels(step_levels(i + 1))
+                    ttnn.synchronize_device(self.mesh_device)
+                    if ttnn.using_distributed_env():
+                        ttnn.distributed_context_barrier()
+                    if i == 0:
+                        dram_probe.report(f"after step 1, rung {rung}")
+                    t_step = time.time() - t_step
+                    if i == 0:
+                        t_first = t_step
+                    else:
+                        t_steady += t_step
+                    on_event(DenoiseStep(step=i + 1, total=len(timesteps), sigma=float(t)))
+            finally:
+                if precompute_modulation:
+                    transformer.release_modulation()
             state.warm = True
             steady_steps = max(len(timesteps) - 1, 1)
             self._log(
