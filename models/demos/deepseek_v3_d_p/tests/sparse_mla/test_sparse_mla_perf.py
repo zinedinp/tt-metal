@@ -21,7 +21,7 @@ Boxes (_BOX, from the device count and TT_MESH_GRAPH_DESC_PATH):
 test_sparse_mla_perf: the CI gate. Warm and long with the production scaled-FP8 KVPE cache (SPxTP-sharded), for
 GATE_CASES: K3.1 (last DSA layer's slot of 24, at
 K3.1's packet size), GLM-5.3 (last full indexer layer) and a GLM-5.3 shared layer (no indexer; reuses that layer's
-top-k). Untraced: fastest of SAMPLES calls after WARMUP discarded ones (tests/measure). Traced: one timed replay of
+top-k). Untraced: fastest of 10 after 10 warm-up (tests/measure). Traced: one timed replay of
 the captured trace. Each (case, box, scenario, mode) is gated two-sided against PERF_TARGETS_MS ± MARGIN[mode] (a
 case without targets only reports), and the traced output must match the untraced one (one extra untimed run of each,
 for triage, plus one untimed eager forward with a per-op host profile). Each layer runs standalone (no next-layer KV
@@ -73,7 +73,6 @@ CHUNK_TOKENS = 5120
 STAGE_4X4_CHUNK_TOKENS = 2560
 WARM_CACHE_TOKENS = 51200
 LONG_CACHE_TOKENS = 512000
-# Untraced: discarded calls (the first compiles), then timed calls, each through sync; the gate takes the fastest.
 SCENARIO_CACHE_TOKENS = {"warm": WARM_CACHE_TOKENS, "long": LONG_CACHE_TOKENS}
 MODES = ("untraced", "traced")
 # Gate cases: (variant, shared_layer). GLM-5.3 also gates a shared layer, which reuses a full layer's top-k and runs
@@ -540,7 +539,7 @@ def test_sparse_mla_perf(request, mesh_device, device_params, variant, case_name
             f"traced output differs from untraced: min per-device PCC {trace_pcc:.6f} (eager vs eager "
             f"{min_pcc(eager_repeat[0], eager_out):.6f}, replay vs replay {min_pcc(traced_repeat[0], traced_out):.6f})"
         )
-    gate(label, results, correctness)
+    gate(label, results, correctness=correctness)
 
 
 # ============================================================================
