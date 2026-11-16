@@ -252,6 +252,8 @@ DispatchMemMap::DispatchMemMap(
         dispatch_s_buffer_end_ + dispatch_s_device_print_l1_cache_size_ + (num_cqs_per_core_ - 1) * cq_zone_stride_;
     TT_FATAL(
         last_cq_zone_end <= l1_size, "Last CQ zone end ({}) extends past L1 end (size {})", last_cq_zone_end, l1_size);
+    l1_footprint_begin_ = l1_base;
+    l1_footprint_end_ = last_cq_zone_end;
 }
 
 uint32_t DispatchMemMap::prefetch_q_entries() const { return settings.prefetch_q_entries_; }

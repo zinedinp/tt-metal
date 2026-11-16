@@ -19,6 +19,7 @@
 namespace tt::tt_metal {
 
 class Buffer;
+class IDevice;
 class Program;
 
 namespace experimental {
@@ -75,6 +76,15 @@ private:
 // With `lockstep_address`, every core's shard is at one address (see CreateKernelConfigBuffer).
 KernelConfigBuffer AllocateKernelConfigBuffer(
     distributed::MeshDevice& device, const CoreRangeSet& cores, uint32_t size, bool lockstep_address = false);
+
+// CreateKernelConfigBuffer for programs launched per device rather than as a MeshWorkload, such as the fast-dispatch
+// command queue programs: one program per device, already laid out. No slow-dispatch check, since fast dispatch may be
+// active. Each device gets its own per-core buffers, for the same cores at the same sizes.
+std::shared_ptr<KernelConfigBufferImpl> CreateKernelConfigBuffer(
+    const std::vector<std::pair<IDevice*, Program*>>& programs, bool lockstep_address);
+
+// The largest Tensix kernel-config block among `program`'s kernel groups. The program must be laid out.
+uint32_t LargestTensixKernelConfigBlock(Program& program);
 
 // Checks that `program`, laid out, can run from `buffer` on `device_id`: the buffer has a shard there on every Tensix
 // core of the program, each kernel group's block fits in the shard on each of its cores, and the program has no Tensix

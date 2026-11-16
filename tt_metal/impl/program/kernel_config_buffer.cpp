@@ -28,6 +28,7 @@
 #include "distributed/sd_mesh_command_queue.hpp"
 #include "impl/allocator/allocator.hpp"
 #include "impl/buffers/buffer_impl.hpp"
+#include "impl/context/context_types.hpp"
 #include "impl/buffers/semaphore.hpp"
 #include "impl/context/metal_context.hpp"
 #include "program_impl.hpp"
@@ -348,6 +349,52 @@ KernelConfigBuffer CreateKernelConfigBuffer(
     }
     log_debug(tt::LogMetal, "Kernel config buffer on MeshDevice {}:{}", device.id(), describe(shards));
     return KernelConfigBuffer(std::make_shared<KernelConfigBufferImpl>(std::move(parts), lockstep_address));
+}
+
+std::shared_ptr<KernelConfigBufferImpl> CreateKernelConfigBuffer(
+    const std::vector<std::pair<IDevice*, Program*>>& programs, bool lockstep_address) {
+    TT_FATAL(!programs.empty(), "A kernel config buffer needs at least one program");
+    std::vector<Program*> laid_out;
+    for (const auto& [device, program] : programs) {
+        TT_FATAL(
+            device->allocator_impl()->get_config().allocator_mode == AllocatorMode::HYBRID,
+            "Device {}: a kernel config buffer is allocated per core, which needs the HYBRID allocator "
+            "(TT_METAL_ALLOCATOR_MODE_HYBRID=1)",
+            device->id());
+        laid_out.push_back(program);
+    }
+    const uint32_t alignment = programs.front().first->allocator_impl()->get_alignment(BufferType::L1);
+    const auto shards = shards_by_size(blocks_on_cores(laid_out, alignment), lockstep_address);
+    std::vector<KernelConfigBufferImpl::Part> parts;
+    for (const auto& [size, cores] : shards) {
+        KernelConfigBufferImpl::Part part{.cores = cores, .size = size};
+        for (const auto& [device, _] : programs) {
+            auto buffer = BufferImpl::create(
+                device,
+                static_cast<DeviceAddr>(size) * cores.num_cores(),
+                size,
+                BufferType::L1,
+                per_core_sharding(cores),
+                lockstep_address ? std::optional<bool>(true) : std::nullopt);
+            if (lockstep_address) {
+                check_lockstep_address(*buffer, cores);
+            }
+            part.device_buffers.push_back(std::move(buffer));
+        }
+        parts.push_back(std::move(part));
+    }
+    log_debug(tt::LogMetal, "Kernel config buffer on {} device(s):{}", programs.size(), describe(shards));
+    return std::make_shared<KernelConfigBufferImpl>(std::move(parts), lockstep_address);
+}
+
+uint32_t LargestTensixKernelConfigBlock(Program& program) {
+    const uint32_t index = tensix_index(program);
+    const ProgramConfig& program_config = program.impl().get_program_config(index);
+    uint32_t largest = 0;
+    for (const auto& kernel_group : program.impl().get_kernel_groups(index)) {
+        largest = std::max(largest, kernel_config_footprint(*kernel_group, program_config));
+    }
+    return largest;
 }
 
 void EnqueueMeshWorkload(

@@ -111,6 +111,7 @@ void DispatchKernelInitializer::teardown(std::unordered_set<InitializerKey>& ini
         terminate_command_queues();
         wait_for_dispatch_cores();
     }
+    release_dispatch_l1();
 
     process_termination_signals();
 
@@ -120,6 +121,12 @@ void DispatchKernelInitializer::teardown(std::unordered_set<InitializerKey>& ini
 }
 
 bool DispatchKernelInitializer::is_initialized() const { return initialized_; }
+
+void DispatchKernelInitializer::release_dispatch_l1() {
+    if (dispatch_topology_ != nullptr) {
+        dispatch_topology_->release_dispatch_l1();
+    }
+}
 
 void DispatchKernelInitializer::compile_dispatch_kernels() {
     if (cluster_.is_mock_or_emulated()) {

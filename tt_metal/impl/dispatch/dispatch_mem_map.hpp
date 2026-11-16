@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include <tt-umd/types/core_coordinates.hpp>
@@ -115,7 +116,13 @@ public:
     // WORKER_COMPLETION_SEMAPHORES L1 region.
     uint32_t get_completion_counter_offset(uint8_t cq_id) const;
 
+    // The L1 the dispatch kernels use on a dispatch core, [begin, end): their queues, buffers and scratch for every
+    // CQ zone. Fixed addresses, outside the allocator.
+    std::pair<uint32_t, uint32_t> l1_footprint() const { return {l1_footprint_begin_, l1_footprint_end_}; }
+
 private:
+    uint32_t l1_footprint_begin_ = 0;
+    uint32_t l1_footprint_end_ = 0;
     uint32_t cmddat_q_base_ = 0;
     uint32_t scratch_db_base_ = 0;
     uint32_t dispatch_buffer_base_ = 0;
