@@ -19,13 +19,13 @@ Boxes (_BOX, from the device count and TT_MESH_GRAPH_DESC_PATH):
   * LoudBox: 2x4, SP on axis 0, Fabric2D.
 
 test_sparse_mla_perf: the CI gate. Warm and long with the production scaled-FP8 KVPE cache (SPxTP-sharded), for
-GATE_CASES: K3.1 (last DSA layer's slot of 24, at
-K3.1's packet size), GLM-5.3 (last full indexer layer) and a GLM-5.3 shared layer (no indexer; reuses that layer's
-top-k). Untraced: fastest of 10 after 10 warm-up (tests/measure). Traced: one timed replay of
-the captured trace. Each (case, box, scenario, mode) is gated two-sided against PERF_TARGETS_MS ± MARGIN[mode] (a
-case without targets only reports), and the traced output must match the untraced one (one extra untimed run of each,
-for triage, plus one untimed eager forward with a per-op host profile). Each layer runs standalone (no next-layer KV
-prefetch overlapped with its attention); the shared layer reuses its push plan, as it would inside a stage.
+GATE_CASES: K3.1 (last DSA layer's slot of 24, at K3.1's packet size), GLM-5.3 (last full indexer layer) and a GLM-5.3
+shared layer (no indexer; reuses that layer's top-k). Untraced: fastest of 10 after 10 warm-up (tests/measure). Traced:
+one timed replay of the captured trace. Each (case, box, scenario, mode) is gated two-sided against PERF_TARGETS_MS ±
+MARGIN[mode] (a case without targets only reports), and the traced output must match the untraced one (one extra untimed
+run of each, for triage, plus one untimed eager forward with a per-op host profile). Each layer runs standalone (no
+next-layer KV prefetch overlapped with its attention); the shared layer reuses its push plan, as it would inside a
+stage.
 
 test_mla_chunked_perf: the exploration matrix (QuietBox, LoudBox, Galaxy; skipped on CI), reports only.
 GLM-5.3 (last full indexer layer, 21-slot index cache) and K3.1 x warm/cold/long x sparse with a BF16 or
