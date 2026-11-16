@@ -64,7 +64,8 @@
 
 /////////////
 // Firmware/kernel code holes
-#define MEM_BRISC_FIRMWARE_SIZE (6 * 1024 + 3072)
+// The 256 B above 9 KiB hold the BRISC RISC-V PMC hook when it is built together with the five perf counter groups.
+#define MEM_BRISC_FIRMWARE_SIZE (6 * 1024 + 3072 + 256)
 // TODO: perhaps put NCRISC FW in the scratch area and free 1.5K after init (GS/WH)
 #define MEM_NCRISC_FIRMWARE_SIZE 2560
 #define MEM_TRISC0_FIRMWARE_SIZE 2560
