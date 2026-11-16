@@ -190,7 +190,7 @@
   cmd: ./tests/scripts/multihost/run_fabric_cpu_only_unit_tests.sh --group teardown-sanity-ttmetal
   skus:
     cpu_medium:
-      timeout: 35
+      timeout: 15  # the full DistributedContext suite runs in ~6 min locally; 15 covers CI + the hang rows
   team: scaleout
   budget_type: unit
   arch: wormhole_b0
