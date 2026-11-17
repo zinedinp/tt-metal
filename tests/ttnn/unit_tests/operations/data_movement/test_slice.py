@@ -1750,6 +1750,61 @@ def test_issue_38841_regression(device):
 
 
 @pytest.mark.parametrize(
+    "input_shape, input_grid, begins, ends, step, use_output_tensor",
+    [
+        # TILE BLOCK_SHARDED → one-shard BLOCK_SHARDED, non-tile-aligned width begin.
+        ((1, 1, 32, 32), (0, 0), [0, 0, 1, 16], [1, 1, 32, 32], [1, 1, 1, 1], False),
+        # Same with tile-aligned begin but preallocated output_tensor.
+        ((1, 1, 32, 32), (0, 0), [0, 0, 0, 16], [1, 1, 32, 32], [1, 1, 1, 1], True),
+        # Strided TILE BLOCK_SHARDED on an asymmetric 3x2 grid.
+        ((1, 1, 33, 65), (2, 1), [0, 0, 0, 0], [1, 1, 32, 32], [1, 1, 1, 2], True),
+    ],
+)
+def test_issue_38841_tile_sharded_rm_only_composite(
+    input_shape, input_grid, begins, ends, step, use_output_tensor, device
+):
+    """TILE BLOCK_SHARDED strided / non-tile-begin slice used to corrupt rows 1+ via RM downgrade."""
+    torch.manual_seed(38841)
+
+    def block_sharded(x1, y1, shape=(32, 32)):
+        grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(x1, y1))})
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(grid, list(shape), ttnn.ShardOrientation.ROW_MAJOR),
+        )
+
+    torch_input = torch.randn(input_shape, dtype=torch.bfloat16)
+    tt_input = ttnn.from_torch(
+        torch_input,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=block_sharded(*input_grid),
+    )
+
+    out_mc = block_sharded(0, 0)
+    want = torch_input[
+        begins[0] : ends[0] : step[0],
+        begins[1] : ends[1] : step[1],
+        begins[2] : ends[2] : step[2],
+        begins[3] : ends[3] : step[3],
+    ]
+
+    if use_output_tensor:
+        out_buf = ttnn.from_torch(
+            torch.full(tuple(want.shape), 7.0, dtype=torch.bfloat16),
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            memory_config=out_mc,
+        )
+        tt_output = ttnn.slice(tt_input, begins, ends, step, output_tensor=out_buf)
+    else:
+        tt_output = ttnn.slice(tt_input, begins, ends, step, memory_config=out_mc)
+
+    assert_equal(want, ttnn.to_torch(tt_output).reshape(want.shape))
+
+
+@pytest.mark.parametrize(
     "input_shape, begins, ends, step",
     [
         [(1, 8190, 1, 128), [0, 0, 0, 0], [1, 8190, 1, 128], [1, 1, 1, 2]],

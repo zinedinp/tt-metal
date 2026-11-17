@@ -89,6 +89,12 @@ inline bool needs_sharded_output_reshard(const ttnn::Tensor& input, const tt::tt
     return input.memory_config().memory_layout() != output_mc.memory_layout();
 }
 
+// TILE sharded + rm_only downgrade hits the legacy RM shard-width padding + view-reshard trap.
+inline bool needs_tile_sharded_composite_fallback(
+    const ttnn::Tensor& input, const tt::tt_metal::MemoryConfig& output_mc, bool rm_only) {
+    return rm_only && input.layout() == Layout::TILE && (input.is_sharded() || is_rm_bw_sharded(output_mc));
+}
+
 }  // namespace detail
 
 template <typename T>
@@ -352,7 +358,9 @@ ttnn::Tensor slice(
         detail::needs_rm_composite_input(input_tensor, output_memory_config, no_step, width_begin_nonzero);
     const bool rm_out_bad = detail::needs_rm_composite_output(input_tensor, output_memory_config);
     const bool out_no_spec = detail::needs_sharded_output_reshard(input_tensor, output_memory_config);
-    if (rm_in_bad || rm_out_bad || out_no_spec) {
+    const bool tile_sharded_bad =
+        detail::needs_tile_sharded_composite_fallback(input_tensor, output_memory_config, rm_only);
+    if (rm_in_bad || rm_out_bad || out_no_spec || tile_sharded_bad) {
         // Snapshot orientation before the L1-interleaved staging hop strips it.
         std::optional<tt::tt_metal::ShardOrientation> input_orientation_hint;
         if (input_tensor.shard_spec().has_value()) {
@@ -360,7 +368,8 @@ ttnn::Tensor slice(
         }
         const auto interleaved_l1 =
             tt::tt_metal::MemoryConfig(tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::L1);
-        Tensor x = rm_in_bad ? ttnn::to_memory_config(input_tensor, interleaved_l1, std::nullopt) : input_tensor;
+        Tensor x = (rm_in_bad || tile_sharded_bad) ? ttnn::to_memory_config(input_tensor, interleaved_l1, std::nullopt)
+                                                   : input_tensor;
         // Intermediate lives in L1 interleaved; to_memory_config lands the result in the caller's
         // buffer. sub_core_grids is threaded through to bound the recursive slice's work split.
         auto sliced = ttnn::slice<T>(x, begins, ends, step, interleaved_l1, std::nullopt, pad_value, sub_core_grids);
