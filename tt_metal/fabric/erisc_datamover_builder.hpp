@@ -156,6 +156,7 @@ struct FabricEriscDatamoverConfig {
     // Global
     static constexpr std::size_t eth_channel_sync_size = 16;
     std::size_t handshake_addr = 0;
+    std::size_t inter_domain_ctrl_address = 0;  // inter-domain fabrics only
     std::size_t edm_channel_ack_addr = 0;
     std::size_t termination_signal_address = 0;  // pad extra bytes to match old EDM so handshake logic will still work
     std::size_t edm_local_sync_address = 0;
@@ -346,9 +347,11 @@ size_t log_worker_to_fabric_edm_sender_rt_args(const std::vector<uint32_t>& args
 // Sender vectors are by flat sender channel (VC0's, then VC1's, then VC2's).
 struct RouterGraphInputs {
     RouterChannelLayout layout;       // this router's channels
-    RouterChannelLayout peer_layout;  // the router across the link
+    RouterChannelLayout peer_layout;  // the router across the link; a perimeter router's own until connect
     std::vector<bool> injection;      // acquires a protected ring (bubble flow control)
     std::vector<bool> serviced;       // a channel, or a slot stock services anyway
+    bool inter_domain = false;        // a perimeter router: its peer is bound at connect
+    bool on_domain_edge = false;      // on a chip with perimeter routers: turns like an edge router
 };
 
 /*
@@ -559,6 +562,8 @@ public:
     std::optional<std::array<std::size_t, builder_config::MAX_NUM_VCS>> actual_receiver_channels_per_vc_ = std::nullopt;
     std::optional<Vc0TrimFastPathInfo> vc0_trim_fast_path_info_ = std::nullopt;
     std::optional<RouterChannelLayout> graph_peer_layout_ = std::nullopt;
+    bool inter_domain_ = false;
+    bool on_domain_edge_ = false;
 
     bool build_in_worker_connection_mode = false;
     size_t firmware_context_switch_interval = default_firmware_context_switch_interval;
