@@ -1120,43 +1120,63 @@ void py_module(nb::module_& mod) {
     // in a barrier forever. An uncaught *Python* exception never reaches std::terminate (the interpreter prints a
     // traceback and exits normally), so without a Python-side hook the peers still hang. Install a sys.excepthook
     // (and threading.excepthook for worker threads) that, after the normal traceback, aborts the job for any
-    // uncaught exception other than KeyboardInterrupt. Idempotent; installed when the context is created.
+    // uncaught exception, KeyboardInterrupt included (P23), plus a sys.exit wrapper for a non-zero SystemExit (P26);
+    // a world of one is left to exit normally (P31). Idempotent; installed when the context is created.
     auto install_python_abort_hooks = [] {
         static bool installed = false;
         if (installed) {
             return;
         }
         installed = true;
-        // TODO(teardown P23): a KeyboardInterrupt on ONE rank (a SIGINT to that pid alone, a debugger detaching) is
-        // an error exit for the job too: the rank leaves with 130 and finalizes, and its peers sit in their collective
-        // until the wall clock or a person. With a live context, abort with 130 instead of excluding it. A Ctrl-C the
-        // launcher forwards reaches every rank, so aborting there is harmless: the job is ending anyway.
-        // Row: teardown_sanity/test_teardown_sanity.py::test_sigint_one_rank.
-        // TODO(teardown P26): sys.excepthook is never called for SystemExit, so a rank that leaves with sys.exit(1)
-        // (click's exit, a script's error return) finalizes and its peers hang. Hook SystemExit with a non-zero code
-        // too (wrap sys.exit, or check the code in an atexit before MPI_Finalize) and abort the job with that code.
-        // Row: teardown_sanity/test_teardown_sanity.py::test_exit1_hangs_peer.
-        auto should_abort = [](nb::handle exc_type) {
-            return DistributedContext::is_initialized() &&
-                   PyErr_GivenExceptionMatches(exc_type.ptr(), PyExc_KeyboardInterrupt) == 0;
+        // Teardown plan P23: a KeyboardInterrupt on one rank (a SIGINT to that pid alone) is an error exit for the job
+        // too: the rank would leave with 130 and finalize while its peers sit in their collective. It aborts with 130.
+        // A Ctrl-C the launcher forwards reaches every rank, so aborting there is harmless: the job is ending anyway.
+        // Teardown plan P31: a world of one has nobody to abort for; the exception then exits normally so the
+        // context's atexit cleanup runs (MPIContext::abort does the same for the hooks that reach it).
+        auto job_has_peers = [] {
+            return DistributedContext::is_initialized() && *DistributedContext::get_current_world()->size() > 1;
+        };
+        auto abort_code_for = [](nb::handle exc_type) {
+            return PyErr_GivenExceptionMatches(exc_type.ptr(), PyExc_KeyboardInterrupt) != 0 ? 130 : 1;
         };
         nb::module_ sys = nb::module_::import_("sys");
         nb::object prev_excepthook = sys.attr("excepthook");
-        sys.attr("excepthook") =
-            nb::cpp_function([prev_excepthook, should_abort](nb::object etype, nb::object value, nb::object tb) {
+        sys.attr("excepthook") = nb::cpp_function(
+            [prev_excepthook, job_has_peers, abort_code_for](nb::object etype, nb::object value, nb::object tb) {
                 prev_excepthook(etype, value, tb);  // keep the normal traceback on stderr
-                if (should_abort(etype)) {
-                    DistributedContext::get_current_world()->abort(1);
+                if (job_has_peers()) {
+                    DistributedContext::get_current_world()->abort(abort_code_for(etype));
                 }
             });
         nb::module_ threading = nb::module_::import_("threading");
         nb::object prev_threadhook = threading.attr("excepthook");
-        threading.attr("excepthook") = nb::cpp_function([prev_threadhook, should_abort](nb::object args) {
-            prev_threadhook(args);
-            if (should_abort(args.attr("exc_type"))) {
-                DistributedContext::get_current_world()->abort(1);
+        threading.attr("excepthook") =
+            nb::cpp_function([prev_threadhook, job_has_peers, abort_code_for](nb::object args) {
+                prev_threadhook(args);
+                if (job_has_peers()) {
+                    DistributedContext::get_current_world()->abort(abort_code_for(args.attr("exc_type")));
+                }
+            });
+        // Teardown plan P26: sys.excepthook is never called for SystemExit, so a rank that leaves with sys.exit(1)
+        // (click's exit, a script's error return) would finalize and its peers hang. sys.exit is wrapped to record
+        // the code it was given, and a Python atexit (which runs before the context's MPI_Finalize) aborts the job
+        // with that code when it is non-zero and the job has peers. A zero code is a clean exit and is left alone.
+        static int recorded_exit_code = 0;
+        nb::object prev_exit = sys.attr("exit");
+        sys.attr("exit") = nb::cpp_function([prev_exit](nb::args args) {
+            int code = 0;
+            if (args.size() > 0 && !args[0].is_none()) {
+                code = nb::isinstance<nb::int_>(args[0]) ? nb::cast<int>(args[0]) : 1;
             }
+            recorded_exit_code = code;
+            prev_exit(*args);  // raises SystemExit exactly as before
         });
+        nb::module_ atexit_mod = nb::module_::import_("atexit");
+        atexit_mod.attr("register")(nb::cpp_function([job_has_peers] {
+            if (recorded_exit_code != 0 && job_has_peers()) {
+                DistributedContext::get_current_world()->abort(recorded_exit_code);
+            }
+        }));
     };
 
     // Initialize the distributed context

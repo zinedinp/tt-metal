@@ -12,7 +12,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <cerrno>
+#include <csignal>
 #include <filesystem>
+#include <fstream>
+#include <sys/types.h>
+#include <unistd.h>
 #include <limits>
 #include <thread>
 #include <memory>
@@ -175,6 +180,38 @@ bool was_mpi_finalized() noexcept {
 // holds only when someone opts in. Decide the owner of the default: a non-zero value here sized for the longest
 // legitimate collective, or tt-run setting TT_METAL_OPERATION_TIMEOUT_SECONDS per rank from the job's shape.
 // Row: test_teardown_sanity.py::test_hang_without_any_timeout.
+// The singleton's private Open MPI session directory (see init_env) and the job's world size, kept at file scope so
+// the abort paths (MPIContext::abort, std::terminate) can clean up and decide whether there is anybody to abort for.
+static std::string g_singleton_session_dir;
+static int g_world_size = 0;
+
+static void remove_singleton_session_dir() {
+    if (!g_singleton_session_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(g_singleton_session_dir, ec);
+        g_singleton_session_dir.clear();
+    }
+}
+
+// Teardown plan P32: a singleton that was killed could not remove its directory; the next singleton init on this host
+// removes the directories whose owner (the pid written into owner.pid at creation) no longer exists.
+static void sweep_stale_singleton_dirs(const std::filesystem::path& base) {
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
+        if (!entry.is_directory(ec) || entry.path().filename().string().rfind("tt_mpi_singleton.", 0) != 0) {
+            continue;
+        }
+        std::ifstream owner(entry.path() / "owner.pid");
+        long pid = 0;
+        if (!(owner >> pid) || pid <= 0) {
+            continue;
+        }
+        if (::kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH) {  // a liveness probe, no signal is sent
+            std::filesystem::remove_all(entry.path(), ec);
+        }
+    }
+}
+
 static double operation_timeout_seconds() {
     const char* v = std::getenv("TT_METAL_OPERATION_TIMEOUT_SECONDS");
     if (v == nullptr || *v == '\0') {
@@ -298,9 +335,6 @@ bool MPIRequest::active() const { return !done_; }
 inline void init_env(int& argc, char**& argv) {
     static std::once_flag mpi_once;
     static int provided_thread_level = MPI_THREAD_SINGLE;
-    // A singleton's private OpenMPI session directory, removed at exit (see the singleton branch below).
-    static std::string singleton_session_dir;
-
     std::call_once(mpi_once, [&] {
         // A process nobody launched (no PMIx rank from mpirun / tt-run) is a singleton: it has no peers, so it has
         // no use for the shared-memory transport, and Open MPI never unlinks a singleton's 16 MB segment
@@ -308,42 +342,35 @@ inline void init_env(int& argc, char**& argv) {
         bool singleton_tmpdir_redirected = false;
         bool had_caller_tmpdir = false;
         std::string caller_tmpdir;
-        if (std::getenv("PMIX_RANK") == nullptr && std::getenv("OMPI_COMM_WORLD_SIZE") == nullptr) {
+        // Teardown plan P29: the TCP-only transport line (btl self,tcp) stays tt-run's launch-line policy. It is not
+        // set from here for launched ranks: every environment write before MPI_Init races the tracy profiler's
+        // worker thread reading the environment (a segfault in getenv seen in CI), and the launch line wins anyway.
+        // test_bare_launch_dead_rank_leaves_no_shm guards the outcome.
+        const bool launched = std::getenv("PMIX_RANK") != nullptr || std::getenv("OMPI_COMM_WORLD_SIZE") != nullptr;
+        if (!launched) {
             setenv("OMPI_MCA_btl", "self", /*overwrite=*/0);
-            // TODO(teardown P29): the TCP-only BTL line (btl self,tcp) that keeps the shared-memory transport, and
-            // its sm_segment leak after a kill, out of every job is tt-run's launch line, not this context's. A
-            // direct mpirun, srun --mpi=pmix, or --mpi-args that adds sm gets the transport back. Set the default
-            // here for every launched process too (no overwrite, so an explicit OMPI_MCA_btl still wins).
-            // Row: test_teardown_sanity.py::test_bare_launch_dead_rank_leaves_no_shm.
             // Open MPI also leaves a singleton's session directory (/tmp/ompi.<host>.<uid>/...) behind — the
             // launcher that would reap it never ran (tt-metal #63870, comprehensively fixed by #63954). Steer that
             // session dir into a private directory we own by pointing TMPDIR at it just for MPI_Init, then remove
             // the directory at exit. The caller's TMPDIR is restored immediately after init so nothing else moves.
             const char* base_env = std::getenv("TMPDIR");
             const std::string base = (base_env != nullptr && base_env[0] != '\0') ? base_env : "/tmp";
+            sweep_stale_singleton_dirs(base);  // P32: what a killed singleton could not remove
             std::string tmpl = base + "/tt_mpi_singleton.XXXXXX";
             std::vector<char> buf(tmpl.c_str(), tmpl.c_str() + tmpl.size() + 1);
             if (mkdtemp(buf.data()) != nullptr) {
-                singleton_session_dir = buf.data();
+                g_singleton_session_dir = buf.data();
+                std::ofstream(std::filesystem::path(g_singleton_session_dir) / "owner.pid") << ::getpid() << "\n";
                 had_caller_tmpdir = (base_env != nullptr);
                 if (had_caller_tmpdir) {
                     caller_tmpdir = base_env;
                 }
-                setenv("TMPDIR", singleton_session_dir.c_str(), /*overwrite=*/1);
+                setenv("TMPDIR", g_singleton_session_dir.c_str(), /*overwrite=*/1);
                 singleton_tmpdir_redirected = true;
-                // TODO(teardown P31, P32): this cleanup is an atexit, so it never runs when the singleton leaves
-                // through MPI_Abort (the Python abort hook on any exception: P31) or is killed (P32), and the
-                // private directory stays. For a world of one there is nobody to abort for: exit normally and let
-                // the atexit run, or remove the directory on the abort path. tt-metal #63954 removes the whole
-                // problem by not initialising MPI for a process no launcher started. Rows:
-                // test_teardown_sanity.py::test_singleton_raise_leaves_nothing, test_singleton_killed_leaves_nothing.
                 // Runs after the MPI_Finalize atexit below (atexit is LIFO), so the session dir is empty by then.
-                std::atexit([] {
-                    if (!singleton_session_dir.empty()) {
-                        std::error_code ec;
-                        std::filesystem::remove_all(singleton_session_dir, ec);
-                    }
-                });
+                // The abort paths (P31) and the next init (P32) remove it too; #63954 makes all of this moot by not
+                // initialising MPI for a process no launcher started.
+                std::atexit(remove_singleton_session_dir);
             }
         }
         // Teardown plan P10: bound MPI_Init so a peer that never joins the wire-up cannot hang the job at start-up.
@@ -398,18 +425,58 @@ inline void init_env(int& argc, char**& argv) {
         // kills the whole process group), and tt-run's session sweep finds the helper on the launch host alone and
         // turns the clean job into exit 1; a direct mpirun or a remote host keeps it.
         // Row: teardown_sanity/test_teardown_sanity.py::test_helper_outlives_rank.
-        // TODO(teardown P27): a rank that exits cleanly while its peers are still in a collective blocks here in the
-        // finalize fence, and the peers in their collective, with no error anywhere. Bound the finalize: an
-        // MPI_Ibarrier polled against the operation timeout before MPI_Finalize, and on expiry abort the job naming
-        // this rank as the one that left early.
-        // Row: teardown_sanity/test_teardown_sanity.py::test_early_exit0_hangs_peer.
         // TODO(teardown P28): the launcher ends every survivor with SIGTERM, and nothing closes the device on it, so
         // the rank dies with the mesh open (firmware not at base, routers running: the next open needs a reset, R5).
         // Install a SIGTERM handler that runs the MetalContext teardown on another thread, bounded, the way
         // simulator_termination.cpp does under TT_METAL_SIMULATOR.
         // Row: teardown_sanity/test_teardown_sanity.py::test_sigterm_runs_close.
-        // Ensure MPI_Finalize is called when the program exits
-        std::atexit([] { MPI_Finalize(); });
+        // Ensure MPI_Finalize is called when the program exits. Teardown plan P27: MPI_Finalize fences on every rank,
+        // so a rank that exits cleanly while its peers are still in a collective would wait here forever, and the
+        // peers in their collective, with no error anywhere. With the operation timeout set, a non-blocking barrier
+        // is polled first: if the peers do not arrive within the timeout this rank is the one that left early, and the
+        // job is aborted with that message instead of hanging on both sides. The default timeout (0) keeps the fence.
+        std::atexit([] {
+            int inited = 0;
+            int finalized = 0;
+            MPI_Initialized(&inited);
+            MPI_Finalized(&finalized);
+            if (inited == 0 || finalized != 0) {
+                return;
+            }
+            const double timeout = operation_timeout_seconds();
+            int size = 1;
+            MPI_Comm_size(MPI_COMM_WORLD, &size);
+            if (timeout > 0.0 && size > 1) {
+                MPI_Request req = MPI_REQUEST_NULL;
+                if (MPI_Ibarrier(MPI_COMM_WORLD, &req) == MPI_SUCCESS) {
+                    const auto start = std::chrono::steady_clock::now();
+                    for (;;) {
+                        int flag = 0;
+                        MPI_Test(&req, &flag, MPI_STATUS_IGNORE);
+                        if (flag != 0) {
+                            break;
+                        }
+                        const double elapsed =
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                        if (elapsed >= timeout) {
+                            int rank = 0;
+                            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+                            std::fprintf(
+                                stderr,
+                                "[MPIContext] rank %d is exiting while its peers are still working (nobody joined the "
+                                "finalize barrier within TT_METAL_OPERATION_TIMEOUT_SECONDS=%.0f s). Aborting the job "
+                                "so "
+                                "every rank ends instead of waiting on each other.\n",
+                                rank,
+                                timeout);
+                            MPI_Abort(MPI_COMM_WORLD, 1);
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                }
+            }
+            MPI_Finalize();
+        });
 
         // Teardown plan P1: a C++ rank that leaves through an uncaught exception (a TT_FATAL becomes one) must not
         // let its peers hang in a barrier. Abort the job so prterun ends every rank with a code instead.
@@ -423,9 +490,10 @@ inline void init_env(int& argc, char**& argv) {
             int finalized = 0;
             MPI_Initialized(&inited);
             MPI_Finalized(&finalized);
-            if (inited != 0 && finalized == 0) {
+            if (inited != 0 && finalized == 0 && g_world_size > 1) {
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
+            remove_singleton_session_dir();  // P31: a world of one has nobody to abort for; leave nothing behind
             std::_Exit(EXIT_FAILURE);
         });
 
@@ -456,6 +524,7 @@ void MPIContext::create(int argc, char** argv) {
 
     ContextPtr parent = std::make_shared<MPIContext>(MPI_COMM_WORLD)->duplicate();
     const int job_world_size = static_cast<int>(*parent->size());
+    g_world_size = job_world_size;
 
     g_mpi_launcher_env_layout = parse_launcher_env_layout_from_env(job_world_size);
 
@@ -854,7 +923,14 @@ void MPIContext::translate_ranks_to_other_ctx(
         group_, static_cast<int>(ranks.size()), ranks.data(), mpi_context->group(), translated_ranks.data()));
 }
 
-void MPIContext::abort(int error_code) const { MPI_Abort(comm_, error_code); }
+void MPIContext::abort(int error_code) const {
+    if (size_ <= 1) {
+        // Teardown plan P31: a singleton has no peers to end; an MPI_Abort here would only skip the atexit that removes
+        // its private session directory. Exit normally with the code instead, so MPI_Finalize and the cleanup run.
+        std::exit(error_code);
+    }
+    MPI_Abort(comm_, error_code);
+}
 
 void MPIContext::revoke_and_shrink() {
 #if (!OMPI_HAS_ULFM)

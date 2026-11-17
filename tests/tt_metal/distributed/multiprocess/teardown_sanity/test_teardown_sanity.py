@@ -430,13 +430,9 @@ def test_singleton_open_close_leaves_nothing(tmp_path):
     assert not left, f"a tt-metal singleton left an Open MPI session directory {left} (#63870)"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P31: a singleton that raises leaves its private session directory: the abort hook's MPI_Abort skips the atexit that removes it; fix: no MPI_Abort for a world of one, or remove the directory on the abort path; #63954 avoids it by never initialising MPI without a launcher",
-)
 def test_singleton_raise_leaves_nothing(tmp_path):
-    """A plain pytest on one host hits an exception after init. The Python abort hook calls MPI_Abort, which ends
-    the process before the atexit that removes the private session directory, so the P11 cleanup never runs."""
+    """A plain pytest on one host hits an exception after init. P31: a world of one has nobody to abort for, so the
+    exception exits normally and the atexit that removes the private session directory runs."""
     r, left = _singleton(
         "singleton_raise", "import ttnn; ttnn.init_distributed_context(); raise RuntimeError('boom')", tmp_path
     )
@@ -446,13 +442,10 @@ def test_singleton_raise_leaves_nothing(tmp_path):
     assert not left, f"a tt-metal singleton that raised left an Open MPI session directory {left} (P31)"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P32: a singleton that is killed leaves its private session directory: nothing in the process can clean up; only #63954's approach, no MPI without a launcher, creates nothing to leave",
-)
 def test_singleton_killed_leaves_nothing(tmp_path):
-    """A plain one-host process killed after init (OOM, kill -9). The private session directory stays because the
-    cleanup is an atexit; #63954 is the fix that leaves nothing to clean, since it starts no MPI for a singleton."""
+    """A plain one-host process killed after init (OOM, kill -9) cannot remove its private session directory. P32:
+    the next singleton init on the host sweeps the directories whose owner pid is gone, so the one left here is
+    removed by a second singleton run against the same TMPDIR. (#63954 makes this moot by starting no MPI at all.)"""
     r, left = _singleton(
         "singleton_killed",
         "import ttnn, os, signal; ttnn.init_distributed_context(); os.kill(os.getpid(), signal.SIGKILL)",
@@ -461,7 +454,18 @@ def test_singleton_killed_leaves_nothing(tmp_path):
     ended(r)
     nonzero(r)
     assert not r.shm_leaked, f"a tt-metal singleton left a shm segment {r.shm_leaked} (#63870)"
-    assert not left, f"a killed tt-metal singleton left an Open MPI session directory {left} (P32)"
+    assert left, "the killed singleton was expected to leave its directory for the next init to sweep"
+    sess = tmp_path / "mpi"
+    r2 = run_case(
+        "singleton_sweep",
+        {"TMPDIR": str(sess)},
+        DEADLINE_END,
+        cmd=[PYTHON, "-c", "import ttnn; ttnn.init_distributed_context()"],
+    )
+    ended(r2)
+    assert r2.exit == 0, str(r2)
+    left_after = sorted(p.name for p in sess.iterdir() if p.name.startswith(("tt_mpi_singleton", "ompi.")))
+    assert not left_after, f"the next singleton init did not sweep the killed singleton's directory: {left_after} (P32)"
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -469,14 +473,9 @@ def test_singleton_killed_leaves_nothing(tmp_path):
 # strict xfail naming the error it exposes, so the suite stays green and the row turns red (XPASS) the day the fix
 # lands, which is the signal to drop the marker. The TODO at the line that should own the fix names the row.
 # ---------------------------------------------------------------------------------------------------------------
-@pytest.mark.xfail(
-    strict=True,
-    reason="P23: a SIGINT to one rank only hangs its peers; fix: the Python abort hook treats KeyboardInterrupt as an error exit (abort 130)",
-)
 def test_sigint_one_rank():
-    """SIGINT reaches rank 1 only (a user interrupts one pid, a debugger detaches): KeyboardInterrupt, the rank
-    leaves with 130 and finalizes, its peer waits in the collective. The job must end non-zero with nothing left.
-    Today the abort hook in distributed_nanobind.cpp excludes KeyboardInterrupt, so nothing ends the peer."""
+    """SIGINT reaches rank 1 only (a user interrupts one pid, a debugger detaches): KeyboardInterrupt. P23: the abort
+    hook treats it like any error exit and aborts the job with 130, so the peer never waits in its collective."""
     r = run_case("sigint_one_rank", {"PROBE_SCENARIO": "sigint", "PROBE_PHASE": "after_open"}, DEADLINE_HANG)
     ended(r)
     nonzero(r)
@@ -526,27 +525,25 @@ def test_launcher_killed_no_session_dir():
 # ---------------------------------------------------------------------------------------------------------------
 # the remaining gaps only the DistributedContext can close (plan P26-P30): one strict xfail each, a TODO at the owner
 # ---------------------------------------------------------------------------------------------------------------
-@pytest.mark.xfail(
-    strict=True,
-    reason="P26: a rank that exits non-zero without an exception (sys.exit(1)) hangs its peers, or the job ends 0 and the code is lost; fix: a SystemExit hook beside the excepthook aborts the job with that code",
-)
 def test_exit1_hangs_peer():
-    """Rank 1 calls sys.exit(1) after open, the way click or a script's error return does. No exception reaches
-    the hooks, the atexit finalize fences on the peers, and rank 0 waits in its collective forever."""
+    """Rank 1 calls sys.exit(1) after open, the way click or a script's error return does. P26: sys.exit records
+    the code and a Python atexit aborts the job with it before the context's finalize could fence on the peers."""
     r = run_case("exit1_after_open", {"PROBE_SCENARIO": "exit1", "PROBE_PHASE": "after_open"}, DEADLINE_HANG)
     ended(r)
     nonzero(r)
     clean(r)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P27: a rank that exits cleanly while its peers still work hangs them; fix: a bounded finalize (MPI_Ibarrier with the operation timeout) that aborts naming the early rank",
-)
 def test_early_exit0_hangs_peer():
     """Rank 1 returns early with exit 0 (a logic bug) while rank 0 enters the barrier. Nothing is an error, so
-    nothing aborts: the finalize fence and the collective wait on each other. The job must still end."""
-    r = run_case("exit0_after_open", {"PROBE_SCENARIO": "exit0", "PROBE_PHASE": "after_open"}, DEADLINE_HANG)
+    nothing aborts and the finalize fence and the collective would wait on each other. P27: with the operation
+    timeout set, the finalize is bounded: rank 1 names itself as the rank that left early and aborts the job.
+    Without a timeout the fence is kept (P30, test_hang_without_any_timeout)."""
+    r = run_case(
+        "exit0_after_open",
+        {"PROBE_SCENARIO": "exit0", "PROBE_PHASE": "after_open", "TT_METAL_OPERATION_TIMEOUT_SECONDS": "8"},
+        DEADLINE_HANG,
+    )
     ended(r)
     nonzero(r)
     clean(r)

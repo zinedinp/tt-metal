@@ -92,9 +92,23 @@ stage of a real distributed job, grouped by the piece that fails:
 - **the solver and descriptor loading** — a rank killed during the solve, an unsatisfiable mesh, a descriptor that
   describes a different machine;
 - **the user's signals** — Ctrl-C / SIGTERM at tt-run while the job is in a collective or in init;
+- **the rank's own exit path** — the exits that are not an exception: a SIGINT delivered to one rank only
+  (`test_sigint_one_rank`: a KeyboardInterrupt aborts the job with 130 when the job has peers), `sys.exit(1)`
+  (`test_exit1_hangs_peer`: the recorded exit code aborts the job from a Python atexit), and an early clean exit while
+  the peers still work (`test_early_exit0_hangs_peer`: the finalize is an `MPI_Ibarrier` polled against
+  `TT_METAL_OPERATION_TIMEOUT_SECONDS`; on expiry the rank names itself and aborts). `test_bare_launch_dead_rank_leaves_no_shm`
+  guards that a `--bare` launch (no TCP-only BTL line) still leaves no `/dev/shm` segment after a kill;
 - **a singleton** — a process nobody launched (`test_singleton_shm`): init asks for the `self` transport only and
   steers Open MPI's session directory into a private `TMPDIR` it removes at exit, so it leaves neither a `/dev/shm`
-  segment nor a `/tmp/ompi.*` directory behind (#63870; the less-invasive counterpart of tt-metal #63954).
+  segment nor a `/tmp/ompi.*` directory behind (#63870; the less-invasive counterpart of tt-metal #63954). The error
+  paths leave nothing either: a singleton that raises exits normally instead of `MPI_Abort`, so the atexit runs
+  (`test_singleton_raise_leaves_nothing`), and a killed singleton's directory, which carries its `owner.pid`, is swept
+  by the next singleton init (`test_singleton_killed_leaves_nothing`);
+- **still open, as strict xfails** — the suite stays green and a row turns red the day its fix lands, so the fix
+  PR drops the marker: a helper that outlives a cleanly exiting rank (`test_helper_outlives_rank`, P24), a killed
+  launcher's session directory (`test_launcher_killed_no_session_dir`, P25, tt-run's), SIGTERM running the device
+  teardown (`test_sigterm_runs_close`, P28), and a hang with no timeout set anywhere (`test_hang_without_any_timeout`,
+  P30, a default-policy decision). Each has a `TODO(teardown P..)` at the line that should own it.
 
 ### Group G — raw-MPI expectation gates
 Two gates that confirm the OpenMPI build we ship provides what the DistributedContext teardown relies on — not
