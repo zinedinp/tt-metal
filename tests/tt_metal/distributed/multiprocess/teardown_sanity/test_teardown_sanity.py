@@ -34,6 +34,7 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parent)
 )  # sanity_common lives next to this file, whatever the import mode
 from sanity_common import (
+    CONFLICT_DESC,
     DEADLINE_END,
     DEADLINE_HANG,
     clean,
@@ -47,6 +48,7 @@ from sanity_common import (
     solve_cmd,
     MGD_QUAD,
     PYTHON,
+    ROOT,
 )
 
 
@@ -401,6 +403,65 @@ def test_singleton_shm(tmp_path):
     assert not r.shm_leaked, f"a tt-metal singleton left a shm segment {r.shm_leaked} (#63870)"
     session_dirs = sorted(p.name for p in sess.iterdir() if p.name.startswith(("tt_mpi_singleton", "ompi.")))
     assert not session_dirs, f"a tt-metal singleton left an Open MPI session directory {session_dirs} (#63870)"
+
+
+def _singleton(name: str, code: str, tmp_path, deadline=DEADLINE_END, env=None):
+    """Run one unlaunched tt-metal process with TMPDIR scoped to the row; return the result and what it left there."""
+    sess = tmp_path / "mpi"
+    sess.mkdir()
+    r = run_case(name, {"TMPDIR": str(sess), **(env or {})}, deadline, cmd=[PYTHON, "-c", code])
+    left = sorted(p.name for p in sess.iterdir() if p.name.startswith(("tt_mpi_singleton", "ompi.")))
+    return r, left
+
+
+def test_singleton_open_close_leaves_nothing(tmp_path):
+    """The full path a one-host pytest takes without a launcher: init, open a 1x1 mesh on the mock, close, exit.
+    Nothing may be left: no segment, no session directory (the #63870 shape, the P11 fix on the clean path)."""
+    r, left = _singleton(
+        "singleton_open_close",
+        "import ttnn; ttnn.init_distributed_context(); m = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 1)); "
+        "ttnn.close_mesh_device(m)",
+        tmp_path,
+        env={"TT_METAL_MOCK_CLUSTER_DESC_PATH": str(ROOT / CONFLICT_DESC)},  # a one-galaxy mock: no device here
+    )
+    ended(r)
+    assert r.exit == 0, str(r)
+    assert not r.shm_leaked, f"a tt-metal singleton left a shm segment {r.shm_leaked} (#63870)"
+    assert not left, f"a tt-metal singleton left an Open MPI session directory {left} (#63870)"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P31: a singleton that raises leaves its private session directory: the abort hook's MPI_Abort skips the atexit that removes it; fix: no MPI_Abort for a world of one, or remove the directory on the abort path; #63954 avoids it by never initialising MPI without a launcher",
+)
+def test_singleton_raise_leaves_nothing(tmp_path):
+    """A plain pytest on one host hits an exception after init. The Python abort hook calls MPI_Abort, which ends
+    the process before the atexit that removes the private session directory, so the P11 cleanup never runs."""
+    r, left = _singleton(
+        "singleton_raise", "import ttnn; ttnn.init_distributed_context(); raise RuntimeError('boom')", tmp_path
+    )
+    ended(r)
+    nonzero(r)
+    assert not r.shm_leaked, f"a tt-metal singleton left a shm segment {r.shm_leaked} (#63870)"
+    assert not left, f"a tt-metal singleton that raised left an Open MPI session directory {left} (P31)"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P32: a singleton that is killed leaves its private session directory: nothing in the process can clean up; only #63954's approach, no MPI without a launcher, creates nothing to leave",
+)
+def test_singleton_killed_leaves_nothing(tmp_path):
+    """A plain one-host process killed after init (OOM, kill -9). The private session directory stays because the
+    cleanup is an atexit; #63954 is the fix that leaves nothing to clean, since it starts no MPI for a singleton."""
+    r, left = _singleton(
+        "singleton_killed",
+        "import ttnn, os, signal; ttnn.init_distributed_context(); os.kill(os.getpid(), signal.SIGKILL)",
+        tmp_path,
+    )
+    ended(r)
+    nonzero(r)
+    assert not r.shm_leaked, f"a tt-metal singleton left a shm segment {r.shm_leaked} (#63870)"
+    assert not left, f"a killed tt-metal singleton left an Open MPI session directory {left} (P32)"
 
 
 # ---------------------------------------------------------------------------------------------------------------

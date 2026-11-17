@@ -331,6 +331,12 @@ inline void init_env(int& argc, char**& argv) {
                 }
                 setenv("TMPDIR", singleton_session_dir.c_str(), /*overwrite=*/1);
                 singleton_tmpdir_redirected = true;
+                // TODO(teardown P31, P32): this cleanup is an atexit, so it never runs when the singleton leaves
+                // through MPI_Abort (the Python abort hook on any exception: P31) or is killed (P32), and the
+                // private directory stays. For a world of one there is nobody to abort for: exit normally and let
+                // the atexit run, or remove the directory on the abort path. tt-metal #63954 removes the whole
+                // problem by not initialising MPI for a process no launcher started. Rows:
+                // test_teardown_sanity.py::test_singleton_raise_leaves_nothing, test_singleton_killed_leaves_nothing.
                 // Runs after the MPI_Finalize atexit below (atexit is LIFO), so the session dir is empty by then.
                 std::atexit([] {
                     if (!singleton_session_dir.empty()) {
