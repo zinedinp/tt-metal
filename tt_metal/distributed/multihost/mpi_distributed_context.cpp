@@ -431,52 +431,13 @@ inline void init_env(int& argc, char**& argv) {
         // simulator_termination.cpp does under TT_METAL_SIMULATOR.
         // Row: teardown_sanity/test_teardown_sanity.py::test_sigterm_runs_close.
         // Ensure MPI_Finalize is called when the program exits. Teardown plan P27: MPI_Finalize fences on every rank,
-        // so a rank that exits cleanly while its peers are still in a collective would wait here forever, and the
-        // peers in their collective, with no error anywhere. With the operation timeout set, a non-blocking barrier
-        // is polled first: if the peers do not arrive within the timeout this rank is the one that left early, and the
-        // job is aborted with that message instead of hanging on both sides. The default timeout (0) keeps the fence.
-        std::atexit([] {
-            int inited = 0;
-            int finalized = 0;
-            MPI_Initialized(&inited);
-            MPI_Finalized(&finalized);
-            if (inited == 0 || finalized != 0) {
-                return;
-            }
-            const double timeout = operation_timeout_seconds();
-            int size = 1;
-            MPI_Comm_size(MPI_COMM_WORLD, &size);
-            if (timeout > 0.0 && size > 1) {
-                MPI_Request req = MPI_REQUEST_NULL;
-                if (MPI_Ibarrier(MPI_COMM_WORLD, &req) == MPI_SUCCESS) {
-                    const auto start = std::chrono::steady_clock::now();
-                    for (;;) {
-                        int flag = 0;
-                        MPI_Test(&req, &flag, MPI_STATUS_IGNORE);
-                        if (flag != 0) {
-                            break;
-                        }
-                        const double elapsed =
-                            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-                        if (elapsed >= timeout) {
-                            int rank = 0;
-                            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-                            std::fprintf(
-                                stderr,
-                                "[MPIContext] rank %d is exiting while its peers are still working (nobody joined the "
-                                "finalize barrier within TT_METAL_OPERATION_TIMEOUT_SECONDS=%.0f s). Aborting the job "
-                                "so "
-                                "every rank ends instead of waiting on each other.\n",
-                                rank,
-                                timeout);
-                            MPI_Abort(MPI_COMM_WORLD, 1);
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    }
-                }
-            }
-            MPI_Finalize();
-        });
+        // so a rank that exits cleanly while its peers are still in a collective waits here until the job ends. The
+        // fence itself is not bounded: a rank cannot tell a peer that is still working (compiling kernels, dumping a
+        // profile) from one that is stuck, and a bound here aborted real jobs whose ranks finish at different times.
+        // What ends the job is the peers' side: with TT_METAL_OPERATION_TIMEOUT_SECONDS set, the collective that
+        // waits for the exited rank expires (wait_or_abort) and aborts the job, which releases this fence too.
+        // Without a timeout (P30) both sides wait forever.
+        std::atexit([] { MPI_Finalize(); });
 
         // Teardown plan P1: a C++ rank that leaves through an uncaught exception (a TT_FATAL becomes one) must not
         // let its peers hang in a barrier. Abort the job so prterun ends every rank with a code instead.

@@ -536,9 +536,11 @@ def test_exit1_hangs_peer():
 
 def test_early_exit0_hangs_peer():
     """Rank 1 returns early with exit 0 (a logic bug) while rank 0 enters the barrier. Nothing is an error, so
-    nothing aborts and the finalize fence and the collective would wait on each other. P27: with the operation
-    timeout set, the finalize is bounded: rank 1 names itself as the rank that left early and aborts the job.
-    Without a timeout the fence is kept (P30, test_hang_without_any_timeout)."""
+    nothing aborts: rank 1 sits in its finalize fence, rank 0 in the barrier. P27: with the operation timeout set,
+    rank 0's barrier expires and aborts the job, which releases rank 1's fence too. The fence itself is not bounded:
+    a rank cannot tell a peer that is still working (compiling kernels, dumping a profile) from one that is stuck,
+    and bounding it aborted real jobs whose ranks finish at different times (the streaming profiler torus test).
+    Without a timeout both wait forever (P30, test_hang_without_any_timeout)."""
     r = run_case(
         "exit0_after_open",
         {"PROBE_SCENARIO": "exit0", "PROBE_PHASE": "after_open", "TT_METAL_OPERATION_TIMEOUT_SECONDS": "8"},
