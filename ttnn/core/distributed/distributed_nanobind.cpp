@@ -1127,6 +1127,11 @@ void py_module(nb::module_& mod) {
             return;
         }
         installed = true;
+        // TODO(teardown P23): a KeyboardInterrupt on ONE rank (a SIGINT to that pid alone, a debugger detaching) is
+        // an error exit for the job too: the rank leaves with 130 and finalizes, and its peers sit in their collective
+        // until the wall clock or a person. With a live context, abort with 130 instead of excluding it. A Ctrl-C the
+        // launcher forwards reaches every rank, so aborting there is harmless: the job is ending anyway.
+        // Row: teardown_sanity/test_teardown_sanity.py::test_sigint_one_rank.
         auto should_abort = [](nb::handle exc_type) {
             return DistributedContext::is_initialized() &&
                    PyErr_GivenExceptionMatches(exc_type.ptr(), PyExc_KeyboardInterrupt) == 0;

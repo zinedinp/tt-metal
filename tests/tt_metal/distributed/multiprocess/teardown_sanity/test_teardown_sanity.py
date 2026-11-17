@@ -400,3 +400,62 @@ def test_singleton_shm(tmp_path):
     assert not r.shm_leaked, f"a tt-metal singleton left a shm segment {r.shm_leaked} (#63870)"
     session_dirs = sorted(p.name for p in sess.iterdir() if p.name.startswith(("tt_mpi_singleton", "ompi.")))
     assert not session_dirs, f"a tt-metal singleton left an Open MPI session directory {session_dirs} (#63870)"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# gaps the launcher covers today that the DistributedContext should own (plan P23-P25). Each row fails today and is a
+# strict xfail naming the error it exposes, so the suite stays green and the row turns red (XPASS) the day the fix
+# lands, which is the signal to drop the marker. The TODO at the line that should own the fix names the row.
+# ---------------------------------------------------------------------------------------------------------------
+@pytest.mark.xfail(
+    strict=True,
+    reason="P23: a SIGINT to one rank only hangs its peers; fix: the Python abort hook treats KeyboardInterrupt as an error exit (abort 130)",
+)
+def test_sigint_one_rank():
+    """SIGINT reaches rank 1 only (a user interrupts one pid, a debugger detaches): KeyboardInterrupt, the rank
+    leaves with 130 and finalizes, its peer waits in the collective. The job must end non-zero with nothing left.
+    Today the abort hook in distributed_nanobind.cpp excludes KeyboardInterrupt, so nothing ends the peer."""
+    r = run_case("sigint_one_rank", {"PROBE_SCENARIO": "sigint", "PROBE_PHASE": "after_open"}, DEADLINE_HANG)
+    ended(r)
+    nonzero(r)
+    clean(r)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P24: a rank's helper outlives it; fix: the rank's exit path ends its own process group (clean exit and abort alike)",
+)
+def test_helper_outlives_rank():
+    """Rank 1 forks a helper that ignores SIGTERM, then finishes its work and exits cleanly. On an abort prterun kills
+    the rank's whole process group, helper included; on a clean exit it only reaps the rank, so the helper lives on.
+    Today only tt-run's session sweep ends it, on the launch host, after the launcher returned, and turns the clean
+    job into exit 1; a direct mpirun or a remote host keeps it. The row asserts the helper is gone and the job is
+    clean without tt-run having to sweep."""
+    r = run_case("helper_outlives_rank", {"PROBE_SCENARIO": "fork_helper", "PROBE_PHASE": "after_open"}, DEADLINE_END)
+    ended(r)
+    clean(r)
+    assert "process(es) of its job alive" not in r.log, (
+        "the helper was ended by tt-run's sweep, not by the rank's own exit path\n" + r.log[-2000:]
+    )
+    assert r.exit == 0, str(r)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P25: a killed launcher leaves its session directory under /tmp; fix: tt-run sweeps this user's unowned launcher session dirs next to the shm sweep",
+)
+def test_launcher_killed_no_session_dir():
+    """kill -9 of prterun while the ranks sit in a collective: tt-run ends the orphaned ranks (#65121), but prterun's
+    exit path never ran, so its session directory under /tmp stays. Nothing may be left, directories included."""
+    r = run_case(
+        "launcher_killed",
+        {"PROBE_COLL": "send_no_recv"},
+        DEADLINE_END,
+        launcher_ready=(0, "coll_ready"),
+        signal_after=3.0,
+        kill_launcher=True,
+    )
+    fault_delivered(r)
+    ended(r)
+    nonzero(r)
+    clean(r)

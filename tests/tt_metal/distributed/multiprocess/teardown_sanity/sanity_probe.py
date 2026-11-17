@@ -10,7 +10,9 @@ collectives section. Timestamped markers on stdout let the test see how far each
 call returned.
 
 Env (all optional):
-  PROBE_SCENARIO   clean | raise | exit_nofinalize | sigkill | abort | use_before_init
+  PROBE_SCENARIO   clean | raise | exit_nofinalize | sigkill | abort | use_before_init | sigint | fork_helper
+                   sigint: SIGINT to this rank alone (KeyboardInterrupt), the peers untouched (P23)
+                   fork_helper: fork a helper that ignores SIGTERM, then go on and exit cleanly (P24)
   PROBE_PHASE      before_init | after_init | in_open | after_open   (where the scenario lands; default after_open)
   PROBE_VICTIM     the rank that misbehaves (default 1)
   PROBE_DELAY_MS   delay before the fault (default 300; in_open: after open_enter)
@@ -30,6 +32,7 @@ from __future__ import annotations
 import atexit
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -90,6 +93,29 @@ def do_fault() -> None:
         os._exit(1)
     if SCENARIO == "sigkill":
         os.kill(os.getpid(), signal.SIGKILL)
+    if SCENARIO == "sigint":
+        # P23: a SIGINT to this rank only (a user interrupts one pid). Python's default handler raises
+        # KeyboardInterrupt in the main thread at the next bytecode, so the sleep below is where it lands.
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(5)
+        mark("sigint did not raise KeyboardInterrupt")
+    if SCENARIO == "fork_helper":
+        # P24: a helper the rank forked (a compile worker, a profiler capture) that ignores SIGTERM and
+        # outlives the rank. The rank then goes on and exits cleanly: on an abort prterun kills the rank's whole
+        # process group, helper included, so the gap is the clean exit, where prterun only reaps the rank. Its
+        # stdio goes to /dev/null so the row measures who ends the helper, not the launcher waiting on a pipe the
+        # helper inherited (that second shape is noted in the plan).
+        helper = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        mark(f"helper forked pid={helper.pid}; the rank goes on and exits cleanly")
 
 
 def is_victim() -> bool:
@@ -97,7 +123,11 @@ def is_victim() -> bool:
 
 
 def maybe_fault(phase: str) -> None:
-    if SCENARIO in ("raise", "abort", "exit_nofinalize", "sigkill") and is_victim() and PHASE == phase:
+    if (
+        SCENARIO in ("raise", "abort", "exit_nofinalize", "sigkill", "sigint", "fork_helper")
+        and is_victim()
+        and PHASE == phase
+    ):
         do_fault()
 
 

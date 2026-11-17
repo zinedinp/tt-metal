@@ -377,6 +377,12 @@ inline void init_env(int& argc, char**& argv) {
             }
         }
 
+        // TODO(teardown P24): on the rank's exit path end this rank's own children first (SIGTERM, a short grace,
+        // SIGKILL on its process group, or PR_SET_PDEATHSIG when they are forked). A helper the rank forked (a compile
+        // worker, a profiler capture) outlives a rank that exits cleanly: prterun only reaps the rank (on an abort it
+        // kills the whole process group), and tt-run's session sweep finds the helper on the launch host alone and
+        // turns the clean job into exit 1; a direct mpirun or a remote host keeps it.
+        // Row: teardown_sanity/test_teardown_sanity.py::test_helper_outlives_rank.
         // Ensure MPI_Finalize is called when the program exits
         std::atexit([] { MPI_Finalize(); });
 

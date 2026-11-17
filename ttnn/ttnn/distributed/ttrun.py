@@ -44,6 +44,10 @@ INTERRUPTED_EXIT_CODE = 130  # 128 + SIGINT
 PRTE_TIMEOUT_EXIT_CODE = 241
 
 
+# TODO(teardown P25): sweep this user's launcher session directories too (prte.<host>.<uid>/dvm.<pid>, ompi.<host>.<uid>/...
+# under the temp root) whose owning launcher is gone. prterun removes them on its exit path; a prterun that is killed
+# (kill -9, an OOM kill, a runner reaping the tree) never runs it, and the DistributedContext cannot act once the
+# launcher is gone. Row: teardown_sanity/test_teardown_sanity.py::test_launcher_killed_no_session_dir.
 def remove_stale_mpi_shm_segments() -> int:
     """Remove this user's Open MPI shared-memory segments that no live process maps (teardown plan P11): what a
     killed job leaves in /dev/shm, 16 MB each, until reboot. Segments of running jobs are mapped and kept. A
