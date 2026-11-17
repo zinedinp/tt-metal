@@ -153,11 +153,40 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None,
         )
 
     # gate/up: bfloat4_b (bandwidth); down: bfloat8_b (accuracy).
+    # local-ai: gemischte Präzision (Q-B) über precision.json im Cache-Wurzelordner (codeki-bfp qb-plan/cache)
     return MLPWeights(
-        w1=load("gate_proj", ttnn.bfloat4_b),
-        w2=load("down_proj", ttnn.bfloat8_b),
-        w3=load("up_proj", ttnn.bfloat4_b),
+        w1=load("gate_proj", _precision(tensor_cache_path, "mlp.gate_proj.weight", ttnn.bfloat4_b)),
+        w2=load("down_proj", _precision(tensor_cache_path, "mlp.down_proj.weight", ttnn.bfloat8_b)),
+        w3=load("up_proj", _precision(tensor_cache_path, "mlp.up_proj.weight", ttnn.bfloat4_b)),
     )
+
+
+_PRECISION_MAPS = {}
+
+
+def _precision(tensor_cache_path, base, default):
+    """local-ai: Präzision je MLP-Gewicht aus `precision.json` (Format codeki-precision-1).
+
+    Schlüssel = Pfad relativ zum Cache-Wurzelordner ohne Endung, z. B. `layers.5/mlp.gate_proj.weight` oder
+    `mtp/layers.3/mlp.up_proj.weight`. Fehlt die Datei oder der Schlüssel: `default` (unverändertes Verhalten)."""
+    if tensor_cache_path is None:
+        return default
+    import json
+    from pathlib import Path
+
+    layer_dir = Path(tensor_cache_path)
+    for root in (layer_dir.parent, layer_dir.parent.parent):
+        f = root / "precision.json"
+        if not f.is_file():
+            continue
+        if f not in _PRECISION_MAPS:
+            m = json.loads(f.read_text())
+            assert m.get("format") == "codeki-precision-1", f"{f}: unbekanntes Format"
+            _PRECISION_MAPS[f] = m["overrides"]
+            print(f"[PRECISION] {f}: {len(m['overrides'])} Abweichungen", flush=True)
+        v = _PRECISION_MAPS[f].get(str((layer_dir / base).relative_to(root)))
+        return getattr(ttnn, v) if v else default
+    return default
 
 
 class Qwen36MLP:
