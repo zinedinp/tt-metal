@@ -43,12 +43,12 @@ class Qwen36GatedDeltaNet:
         assert _pf in _fid, f"QWEN_GDN_FIDELITY={_pf}: erlaubt {sorted(_fid)}"
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=_fid[_pf],
-            fp32_dest_acc_en=True,
+            math_approx_mode=os.environ.get("QWEN_MATH_APPROX", "1") == "1", fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
         self.compute_kernel_config_decode = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.LoFi,
-            fp32_dest_acc_en=True,
+            math_approx_mode=os.environ.get("QWEN_MATH_APPROX", "1") == "1", fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
 

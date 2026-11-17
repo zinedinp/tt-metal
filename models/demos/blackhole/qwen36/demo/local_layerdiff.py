@@ -19,6 +19,7 @@ import pytest
 import torch
 from loguru import logger
 from safetensors import safe_open
+from safetensors.torch import save_file
 
 import ttnn
 from models.common.utility_functions import run_for_blackhole
@@ -34,6 +35,8 @@ TAG = os.environ.get("QA_TAG", "base")
 _lo, _, _hi = os.environ.get("LD_LAYERS", "0-63").partition("-")
 LAYERS = range(int(_lo), int(_hi or _lo) + 1)
 OUT = Path(os.environ.get("LD_OUT", str(QA_DIR / f"layerdiff-{TAG}.json")))
+# LD_DUMP=<Ordner>: je Schicht L<i>.safetensors (Karte + torch-Wahrheit) für codeki-ref schreiben.
+DUMP = Path(os.environ["LD_DUMP"]) if os.environ.get("LD_DUMP") else None
 PREFIX = "model.language_model."
 
 
@@ -166,6 +169,23 @@ def test_layerdiff(mesh_device):
         r["layer_out"] = _m(x_out - x_in, out_ref - x_in, x_in)
         r["resid_norm"] = x_in.norm(dim=-1).mean().item()
         rows.append(r)
+        if DUMP is not None:
+            # Für codeki-ref (Rust-Referenz): Karteneingabe/-ausgaben + torch-Wahrheit, FP32, [T, H].
+            DUMP.mkdir(parents=True, exist_ok=True)
+            save_file(
+                {
+                    "x_in": x_in.contiguous(),
+                    "h_mid": h_mid.contiguous(),
+                    "x_out": x_out.contiguous(),
+                    "mix_card": mix_card.contiguous(),
+                    "mlp_card": mlp_card.contiguous(),
+                    "mix_torch": mix_ref.contiguous(),
+                    "mlp_torch": mlp_ref.contiguous(),
+                    "ids": ids[0].to(torch.int32).contiguous(),
+                },
+                str(DUMP / f"L{i:02d}.safetensors"),
+                metadata={"kind": kind, "layer": str(i), "T": str(T)},
+            )
         mx, ml = r.get("mixer", {}), r.get("mlp", {})
         logger.info(
             f"[LD] L{i:02d} {r['kind']:4s} mixer rel={mx.get('rel', float('nan')):.3e} cos={mx.get('cos', float('nan')):.5f} "

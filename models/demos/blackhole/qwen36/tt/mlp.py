@@ -214,15 +214,20 @@ class Qwen36MLP:
         self.weights = load_mlp_weights(
             mesh_device, state_dict, tensor_cache_path, args=args, use_gateup_agmm=use_gateup_agmm
         )
+        # local-ai: QWEN_MLP_FIDELITY=lofi|hifi2|hifi3|hifi4 für den Prefill-Pfad (Q-A-Gegenprobe, PROTOKOLL 86+).
+        _fid = {"lofi": ttnn.MathFidelity.LoFi, "hifi2": ttnn.MathFidelity.HiFi2,
+                "hifi3": ttnn.MathFidelity.HiFi3, "hifi4": ttnn.MathFidelity.HiFi4}
+        _pf = os.environ.get("QWEN_MLP_FIDELITY", "lofi").lower()
+        assert _pf in _fid, f"QWEN_MLP_FIDELITY={_pf}: erlaubt {sorted(_fid)}"
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=False
+            math_fidelity=_fid[_pf], math_approx_mode=os.environ.get("QWEN_MATH_APPROX", "1") == "1", fp32_dest_acc_en=True, packer_l1_acc=False
         )
         # fuse_swiglu AGMM: fp32 acc (subblock_w=4) to match GDN/attn in-proj.
         self.compute_kernel_config_agmm = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=False
+            math_fidelity=_fid[_pf], math_approx_mode=os.environ.get("QWEN_MATH_APPROX", "1") == "1", fp32_dest_acc_en=True, packer_l1_acc=False
         )
         self.compute_kernel_config_decode = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True
+            math_fidelity=ttnn.MathFidelity.LoFi, math_approx_mode=os.environ.get("QWEN_MATH_APPROX", "1") == "1", fp32_dest_acc_en=True, packer_l1_acc=True
         )
 
     def forward(self, x, mode=None):
