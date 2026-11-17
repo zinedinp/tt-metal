@@ -171,6 +171,10 @@ bool was_mpi_finalized() noexcept {
 // Teardown plan P16: a per-call deadline for the collectives that wait on a peer. 0 (the default) keeps the
 // unbounded wait, so a legitimately long or slow-but-arriving collective is left alone; a positive value bounds a
 // collective that hangs because a specific rank never arrived.
+// TODO(teardown P30): with the default 0 here and no --timeout from tt-run, a hung collective never ends and R2
+// holds only when someone opts in. Decide the owner of the default: a non-zero value here sized for the longest
+// legitimate collective, or tt-run setting TT_METAL_OPERATION_TIMEOUT_SECONDS per rank from the job's shape.
+// Row: test_teardown_sanity.py::test_hang_without_any_timeout.
 static double operation_timeout_seconds() {
     const char* v = std::getenv("TT_METAL_OPERATION_TIMEOUT_SECONDS");
     if (v == nullptr || *v == '\0') {
@@ -306,6 +310,11 @@ inline void init_env(int& argc, char**& argv) {
         std::string caller_tmpdir;
         if (std::getenv("PMIX_RANK") == nullptr && std::getenv("OMPI_COMM_WORLD_SIZE") == nullptr) {
             setenv("OMPI_MCA_btl", "self", /*overwrite=*/0);
+            // TODO(teardown P29): the TCP-only BTL line (btl self,tcp) that keeps the shared-memory transport, and
+            // its sm_segment leak after a kill, out of every job is tt-run's launch line, not this context's. A
+            // direct mpirun, srun --mpi=pmix, or --mpi-args that adds sm gets the transport back. Set the default
+            // here for every launched process too (no overwrite, so an explicit OMPI_MCA_btl still wins).
+            // Row: test_teardown_sanity.py::test_bare_launch_dead_rank_leaves_no_shm.
             // Open MPI also leaves a singleton's session directory (/tmp/ompi.<host>.<uid>/...) behind — the
             // launcher that would reap it never ran (tt-metal #63870, comprehensively fixed by #63954). Steer that
             // session dir into a private directory we own by pointing TMPDIR at it just for MPI_Init, then remove
@@ -383,6 +392,16 @@ inline void init_env(int& argc, char**& argv) {
         // kills the whole process group), and tt-run's session sweep finds the helper on the launch host alone and
         // turns the clean job into exit 1; a direct mpirun or a remote host keeps it.
         // Row: teardown_sanity/test_teardown_sanity.py::test_helper_outlives_rank.
+        // TODO(teardown P27): a rank that exits cleanly while its peers are still in a collective blocks here in the
+        // finalize fence, and the peers in their collective, with no error anywhere. Bound the finalize: an
+        // MPI_Ibarrier polled against the operation timeout before MPI_Finalize, and on expiry abort the job naming
+        // this rank as the one that left early.
+        // Row: teardown_sanity/test_teardown_sanity.py::test_early_exit0_hangs_peer.
+        // TODO(teardown P28): the launcher ends every survivor with SIGTERM, and nothing closes the device on it, so
+        // the rank dies with the mesh open (firmware not at base, routers running: the next open needs a reset, R5).
+        // Install a SIGTERM handler that runs the MetalContext teardown on another thread, bounded, the way
+        // simulator_termination.cpp does under TT_METAL_SIMULATOR.
+        // Row: teardown_sanity/test_teardown_sanity.py::test_sigterm_runs_close.
         // Ensure MPI_Finalize is called when the program exits
         std::atexit([] { MPI_Finalize(); });
 

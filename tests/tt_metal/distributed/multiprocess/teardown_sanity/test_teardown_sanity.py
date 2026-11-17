@@ -23,6 +23,7 @@ tests/scripts/multihost/run_fabric_cpu_only_unit_tests.sh).
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
 from pathlib import Path
@@ -458,4 +459,80 @@ def test_launcher_killed_no_session_dir():
     fault_delivered(r)
     ended(r)
     nonzero(r)
+    clean(r)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# the remaining gaps only the DistributedContext can close (plan P26-P30): one strict xfail each, a TODO at the owner
+# ---------------------------------------------------------------------------------------------------------------
+@pytest.mark.xfail(
+    strict=True,
+    reason="P26: a rank that exits non-zero without an exception (sys.exit(1)) hangs its peers, or the job ends 0 and the code is lost; fix: a SystemExit hook beside the excepthook aborts the job with that code",
+)
+def test_exit1_hangs_peer():
+    """Rank 1 calls sys.exit(1) after open, the way click or a script's error return does. No exception reaches
+    the hooks, the atexit finalize fences on the peers, and rank 0 waits in its collective forever."""
+    r = run_case("exit1_after_open", {"PROBE_SCENARIO": "exit1", "PROBE_PHASE": "after_open"}, DEADLINE_HANG)
+    ended(r)
+    nonzero(r)
+    clean(r)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P27: a rank that exits cleanly while its peers still work hangs them; fix: a bounded finalize (MPI_Ibarrier with the operation timeout) that aborts naming the early rank",
+)
+def test_early_exit0_hangs_peer():
+    """Rank 1 returns early with exit 0 (a logic bug) while rank 0 enters the barrier. Nothing is an error, so
+    nothing aborts: the finalize fence and the collective wait on each other. The job must still end."""
+    r = run_case("exit0_after_open", {"PROBE_SCENARIO": "exit0", "PROBE_PHASE": "after_open"}, DEADLINE_HANG)
+    ended(r)
+    nonzero(r)
+    clean(r)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P28: SIGTERM from the launcher runs no device teardown; fix: a SIGTERM handler that runs the MetalContext teardown before the rank dies (the simulator's path, generalised)",
+)
+def test_sigterm_runs_close():
+    """SIGTERM reaches rank 1 with its mesh open (what the launcher sends every survivor when a job ends). The rank
+    must close its device on the way out: on the mock that is the close_done marker; on hardware it is firmware
+    back at base and the routers stopped (R5). Today the default disposition kills it where it stands."""
+    r = run_case(
+        "sigterm_with_mesh_open",
+        {"PROBE_COLL": "barrier_slow", "PROBE_SLOW_S": "8"},
+        DEADLINE_END,
+        rank_signal=(1, signal.SIGTERM, 0.5),
+        signal_on_marker="coll_ready",
+    )
+    fault_delivered(r)
+    ended(r)
+    nonzero(r)
+    clean(r)
+    rank_saw(r, 1, "close_done")
+
+
+def test_bare_launch_dead_rank_leaves_no_shm():
+    """P29 guard: tt-run --bare drops the TCP-only BTL line, so the shared-memory transport is back. A rank killed
+    with the mesh open must still leave no sm_segment behind. If this row fails, the context should set the BTL
+    default itself before MPI_Init instead of relying on tt-run's launch line."""
+    cmd = legacy_cmd()
+    cmd.insert(cmd.index(PYTHON), "--bare")
+    r = run_case("bare_dead_rank", {"PROBE_SCENARIO": "sigkill", "PROBE_PHASE": "after_open"}, DEADLINE_END, cmd=cmd)
+    ended(r)
+    nonzero(r)
+    clean(r)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P30: with no timeout set anywhere a hung collective never ends; policy: a default for TT_METAL_OPERATION_TIMEOUT_SECONDS, or tt-run setting it per rank",
+)
+def test_hang_without_any_timeout():
+    """Rank 1 skips the barrier and nobody set a timeout: not the operation timeout, not PRRTE's --timeout. R2 says
+    the job ends by itself; today both defaults are off, so it does not."""
+    assert not os.environ.get("TT_METAL_OPERATION_TIMEOUT_SECONDS"), "this row needs the operation timeout unset"
+    r = run_case("hang_no_timeout", {"PROBE_COLL": "barrier_skip"}, DEADLINE_HANG)
+    ended(r)
     clean(r)

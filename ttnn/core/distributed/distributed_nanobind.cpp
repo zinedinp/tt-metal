@@ -1132,6 +1132,10 @@ void py_module(nb::module_& mod) {
         // until the wall clock or a person. With a live context, abort with 130 instead of excluding it. A Ctrl-C the
         // launcher forwards reaches every rank, so aborting there is harmless: the job is ending anyway.
         // Row: teardown_sanity/test_teardown_sanity.py::test_sigint_one_rank.
+        // TODO(teardown P26): sys.excepthook is never called for SystemExit, so a rank that leaves with sys.exit(1)
+        // (click's exit, a script's error return) finalizes and its peers hang. Hook SystemExit with a non-zero code
+        // too (wrap sys.exit, or check the code in an atexit before MPI_Finalize) and abort the job with that code.
+        // Row: teardown_sanity/test_teardown_sanity.py::test_exit1_hangs_peer.
         auto should_abort = [](nb::handle exc_type) {
             return DistributedContext::is_initialized() &&
                    PyErr_GivenExceptionMatches(exc_type.ptr(), PyExc_KeyboardInterrupt) == 0;

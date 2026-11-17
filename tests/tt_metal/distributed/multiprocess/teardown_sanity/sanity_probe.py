@@ -12,6 +12,8 @@ call returned.
 Env (all optional):
   PROBE_SCENARIO   clean | raise | exit_nofinalize | sigkill | abort | use_before_init | sigint | fork_helper
                    sigint: SIGINT to this rank alone (KeyboardInterrupt), the peers untouched (P23)
+                   exit1: sys.exit(1), no exception: click's exit, a script's error return (P26)
+                   exit0: sys.exit(0) while the peers still work: a logic bug's early return (P27)
                    fork_helper: fork a helper that ignores SIGTERM, then go on and exit cleanly (P24)
   PROBE_PHASE      before_init | after_init | in_open | after_open   (where the scenario lands; default after_open)
   PROBE_VICTIM     the rank that misbehaves (default 1)
@@ -93,6 +95,10 @@ def do_fault() -> None:
         os._exit(1)
     if SCENARIO == "sigkill":
         os.kill(os.getpid(), signal.SIGKILL)
+    if SCENARIO == "exit1":
+        sys.exit(1)  # P26: no exception, so no hook fires; the atexit finalize fences on the peers
+    if SCENARIO == "exit0":
+        sys.exit(0)  # P27: no error anywhere; the finalize fence and the peers' collective wait on each other
     if SCENARIO == "sigint":
         # P23: a SIGINT to this rank only (a user interrupts one pid). Python's default handler raises
         # KeyboardInterrupt in the main thread at the next bytecode, so the sleep below is where it lands.
@@ -124,7 +130,7 @@ def is_victim() -> bool:
 
 def maybe_fault(phase: str) -> None:
     if (
-        SCENARIO in ("raise", "abort", "exit_nofinalize", "sigkill", "sigint", "fork_helper")
+        SCENARIO in ("raise", "abort", "exit_nofinalize", "sigkill", "sigint", "fork_helper", "exit1", "exit0")
         and is_victim()
         and PHASE == phase
     ):
