@@ -9,6 +9,7 @@
 #   QA_TAG=base                             Name des Kandidaten (tt-<tag>-<text>.kld)
 #   QA_LOGITS=fp32                          fp32 (misst die Gewichte) | bf16 (wie der Decode-Pfad)
 #   QA_BOS=<id>                             nur falls die Referenz BOS an den Chunkanfang setzt
+#   QA_CHUNKS=N                             Schnelltest: nur die ersten N Chunks (codeki-qa vergleicht den Anfang)
 import os
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ BASES = [b for b in os.environ.get("QA_BASE", "q6k-prose.kld,q6k-code.kld").spli
 TAG = os.environ.get("QA_TAG", "base")
 LOGITS = os.environ.get("QA_LOGITS", "fp32")
 BOS = os.environ.get("QA_BOS")
+CHUNKS = int(os.environ.get("QA_CHUNKS", "0"))
 ROWS = 128  # LM-Head-Stück (128 x 248320 fp32 = 127 MB)
 
 
@@ -104,7 +106,10 @@ def test_qa(mesh_device):
 
     for name, n_ctx, n_vocab, n_chunk, head, tokens in bases:
         first = n_ctx // 2
-        dst = QA_DIR / f"tt-{TAG}-{name.removeprefix('q6k-')}"
+        if 0 < CHUNKS < n_chunk:  # Kopf mit n_chunk=N und nur den Token dieser Chunks
+            n_chunk = CHUNKS
+            head = head[:16] + np.int32(n_chunk).astype("<i4").tobytes() + tokens[:n_chunk].astype("<i4").tobytes()
+        dst = QA_DIR / f"tt-{TAG}-{name.split('-', 1)[1]}"
         tmp = dst.with_suffix(".tmp")
         t1 = time.time()
         with open(tmp, "wb") as f:

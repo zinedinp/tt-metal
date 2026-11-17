@@ -5,6 +5,8 @@
 Wraps the experimental ``gated_deltanet_forward_ttnn()`` and the on-device GDN prefill
 kernel into a module that manages weight tensors, recurrent state, and conv state.
 """
+import os
+
 import ttnn
 from models.demos.blackhole.qwen36.tt.gdn.config import GDNConfig
 from models.demos.blackhole.qwen36.tt.gdn.decode import recurrent_forward
@@ -34,8 +36,13 @@ class Qwen36GatedDeltaNet:
         self.norm_eps = config.norm_eps
         self.long_prefill_chunk_size = config.long_prefill_chunk_size
 
+        # local-ai: QWEN_GDN_FIDELITY=lofi|hifi2|hifi3|hifi4 für den Prefill-Pfad (Q-A-Gegenprobe, PROTOKOLL 86+).
+        _fid = {"lofi": ttnn.MathFidelity.LoFi, "hifi2": ttnn.MathFidelity.HiFi2,
+                "hifi3": ttnn.MathFidelity.HiFi3, "hifi4": ttnn.MathFidelity.HiFi4}
+        _pf = os.environ.get("QWEN_GDN_FIDELITY", "lofi").lower()
+        assert _pf in _fid, f"QWEN_GDN_FIDELITY={_pf}: erlaubt {sorted(_fid)}"
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.LoFi,
+            math_fidelity=_fid[_pf],
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
