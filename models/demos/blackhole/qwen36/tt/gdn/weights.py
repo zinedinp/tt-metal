@@ -244,7 +244,18 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
 
     # Mega-fused weight: QKV + a + b + g in one [4096, 12352] matmul
     # Eliminates 2 separate matmuls (g_proj, ab_proj) per decode step
-    mega_fused_weight = _precompute_mega_fused_weight()
+    # local-ai: QWEN36_NO_MEGA=1 skips the decode-only mega-fused copy (QKV+a+b+g, ~90 MB/layer = 4.3 GB on the
+    # 27B) — it duplicates qkv_proj/g_proj/a/b, which prefill keeps using. Decode then runs the separate matmuls.
+    import os as _os
+
+    mega_fused_weight = None if _os.environ.get("QWEN36_NO_MEGA") == "1" else _precompute_mega_fused_weight()
+    # local-ai: QWEN36_DROP_SPLIT=1 keeps the mega-fused weight (used for prefill AND decode on one device) and frees
+    # the split qkv_proj/g_proj copies instead (~4.3 GB on the 27B). a/b stay (tiny).
+    if _os.environ.get("QWEN36_DROP_SPLIT") == "1" and mega_fused_weight is not None:
+        ttnn.deallocate(qkv_proj_weight)
+        ttnn.deallocate(g_proj_weight)
+        qkv_proj_weight = None
+        g_proj_weight = None
     if mega_fused_weight is not None:
         mega_qkv_dim = config.q_dim + config.k_dim + config.v_dim
         mega_a_dim = num_v_heads

@@ -437,6 +437,12 @@ def test_demo_text(
             )
         return
 
+    if os.environ.get("QWEN36_SPEC_1DEV") == "1":
+        # local-ai: experimental single-P150 MTP spec decode (TP-only upstream)
+        generated, perf = _run_tp_spec_generation(model, tokenizer, token_ids, max_generated_tokens, num_blocks)
+        text = tokenizer.decode(generated, skip_special_tokens=True)
+        logger.info(f"[SPEC_1DEV] ttft={perf['ttft_s']:.2f}s decode={perf['decode_tok_s']:.2f} tok/s text={text[:300]!r}")
+        return
     if use_trace:
         generated, perf = _run_traced_generation(
             model,

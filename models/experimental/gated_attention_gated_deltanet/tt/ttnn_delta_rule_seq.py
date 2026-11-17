@@ -160,6 +160,12 @@ def chunk_gated_delta_rule_seq_adapter(
     q_bh = _to_bhtd(q, K, Hq, l2=_defer_l2)
     k_bh = _to_bhtd(k, K, Hq, l2=_defer_l2)
     v_bh = _to_bhtd(v, V, H)
+    if not _defer_l2:
+        # local-ai: q/k here are the adapter's own L2-normed copies (L1 for short T). They are dead once relaid to
+        # q_bh/k_bh, but stayed allocated through the seq-scan kernel below; with 48 GDN heads (27B on one P150)
+        # they overlap the kernel's ~1.43 MB static CBs at T=512. Free them now.
+        ttnn.deallocate(q)
+        ttnn.deallocate(k)
     if Hq != H:
         # GQA: repeat_interleave q/k along BH dim (Hq -> H heads); norm+permute ran on Hq only.
         rf = H // Hq
@@ -718,6 +724,68 @@ def chunk_gated_delta_rule_seq(
             ttnn.float32,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+
+    # local-ai debug: QWEN36_L1_DUMP=1 -> before every scan-kernel call print the L1 allocator state; on the first
+    # call that finds L1 in use, also dump the full device memory state (find what clashes with the ~1.4 MB CBs).
+    if _os.environ.get("QWEN36_L1_DUMP") == "1":
+        _n = globals()["_L1_CALLS"] = globals().get("_L1_CALLS", 0) + 1
+        try:
+            _mv = ttnn.get_memory_view(mesh_device, ttnn.BufferType.L1)
+            _used = _mv.total_bytes_allocated_per_bank
+            _blocks = [b for b in _mv.block_table if b.get("allocated") == "yes"]
+            print(f"[L1_DUMP] call#{_n} BH={BH} T={T} chunk={chunk_size} L1 used/bank={_used} "
+                  f"largest_free={_mv.largest_contiguous_bytes_free_per_bank} allocated_blocks={_blocks}", flush=True)
+            if _used > 0 and not globals().get("_L1_DUMPED"):
+                globals()["_L1_DUMPED"] = True
+                import gc as _gc
+                import inspect as _inspect
+
+                # nanobind ttnn.Tensor objects are not gc-tracked themselves -> look inside gc-tracked containers
+                # (dicts/lists/tuples/object __dict__s) and the caller frames' locals; name them where possible.
+                _cands = {}
+
+                _TT = ttnn.Tensor
+
+                def _add(_v, _where):
+                    if type(_v) is _TT:  # exact type check: isinstance() can trigger lazy-module imports
+                        _cands.setdefault(id(_v), [_v, []])[1].append(_where)
+
+                for _fi in _inspect.stack()[:12]:
+                    for _k, _v in list(_fi.frame.f_locals.items()):
+                        _add(_v, f"{_fi.function}:{_k}")
+                        if type(_v) in (list, tuple):
+                            for _x in _v:
+                                _add(_x, f"{_fi.function}:{_k}[]")
+                for _o in _gc.get_objects():
+                    try:
+                        _ty = type(_o)
+                        if _ty is dict:
+                            for _k, _v in list(_o.items()):
+                                if type(_v) is _TT:
+                                    _add(_v, f"dict[{str(_k)[:40]}]")
+                        elif _ty is list or _ty is tuple:
+                            for _v in _o:
+                                if type(_v) is _TT:
+                                    _add(_v, _ty.__name__)
+                    except Exception:
+                        pass
+                print(f"[L1_DUMP]   scanned {len(_cands)} reachable ttnn tensors", flush=True)
+                _err = None
+                for _t, _where in _cands.values():
+                    try:
+                        if _t.storage_type() == ttnn.StorageType.DEVICE and _t.is_allocated():
+                            _mc = _t.memory_config()
+                            if _mc.buffer_type == ttnn.BufferType.L1:
+                                print(f"[L1_DUMP]   L1 tensor shape={tuple(_t.shape)} dtype={_t.dtype} layout={_t.layout} "
+                                      f"mem={_mc.memory_layout} where={_where[:6]}", flush=True)
+                    except Exception as _e:
+                        _err = _e
+                if _err is not None:
+                    print(f"[L1_DUMP]   (some tensors not inspectable: {_err!r})", flush=True)
+                ttnn.dump_device_memory_state(mesh_device, prefix=f"l1dump_call{_n}_")
+                print(f"[L1_DUMP] full dump written: generated/reports/l1dump_call{_n}_*", flush=True)
+        except Exception as _e:
+            print(f"[L1_DUMP] failed: {_e!r}", flush=True)
 
     # ---- C++ sequential scan kernel (Path A) ----
     out_4d, final_state = ttnn.transformer.gated_delta_attn_seq(

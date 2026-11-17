@@ -18,6 +18,11 @@ from .ttnn_delta_rule_ops import (
 from .ttnn_delta_rule_seq import chunk_gated_delta_rule_seq_adapter
 
 _L1_SEQ_THRESHOLD = 512
+# local-ai: single-P150 27B (48 value heads) — at T=512 the L1-resident GDN activations (~152 KB/bank) overlap the
+# seq-scan kernel's ~1.43 MB static CBs. QWEN36_GDN_L1_SEQ=256 keeps T<=256 in L1 and moves T=512 to DRAM.
+import os as _os_l1
+
+_L1_SEQ_THRESHOLD = int(_os_l1.environ.get("QWEN36_GDN_L1_SEQ", _L1_SEQ_THRESHOLD))
 
 
 def _seq_memory_config(seq_len):
@@ -744,7 +749,8 @@ def gated_deltanet_forward_ttnn(
         )
 
     # Output norm + projection (clip before o_proj to avoid sparse overflow)
-    if use_gate and g_proj_weight is not None:
+    # local-ai: gate may come from the mega-fused output even when the split g weight was freed
+    if use_gate and (g_proj_weight is not None or _mega_extracted):
         if _mega_extracted:
             gate = ttnn.reshape(gate_raw, [B, T, num_v_heads, head_v_dim], memory_config=mc)
         else:

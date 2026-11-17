@@ -294,8 +294,19 @@ def gated_attention_forward_ttnn(
         key_fill = key_states[:, :, :page_len, :] if page_len < key_states.shape[2] else key_states
         value_fill = value_states[:, :, :page_len, :] if page_len < value_states.shape[2] else value_states
 
+        # local-ai: bf8 paged KV (QWEN_SDPA_BF8=1) on one P150 — paged_fill_cache does not cast, so cast only
+        # the fill copies to the cache dtype (Q/K/V for the SDPA stay bf16, see note above).
+        _casted = []
+        if key_fill.dtype != paged_kv_cache_key.dtype:
+            key_fill = ttnn.typecast(key_fill, paged_kv_cache_key.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _casted.append(key_fill)
+        if value_fill.dtype != paged_kv_cache_value.dtype:
+            value_fill = ttnn.typecast(value_fill, paged_kv_cache_value.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _casted.append(value_fill)
         ttnn.experimental.paged_fill_cache(paged_kv_cache_key, key_fill, chunk_page_table, batch_idx=0)
         ttnn.experimental.paged_fill_cache(paged_kv_cache_value, value_fill, chunk_page_table, batch_idx=0)
+        for _t in _casted:
+            ttnn.deallocate(_t)
         ttnn.deallocate(key_states)
         ttnn.deallocate(value_states)
 

@@ -395,7 +395,10 @@ class MTPSpecEngine:
 
     def __init__(self, model, batch_size, draft_len):
         assert model.mtp is not None, "model has no MTP head (has_mtp / mtp.* weights?)"
-        assert model.num_devices > 1, "MTPSpecEngine is TP-only for now"
+        # local-ai: QWEN36_SPEC_1DEV=1 lifts the TP-only gate to try spec decode on one P150
+        import os
+
+        assert model.num_devices > 1 or os.environ.get("QWEN36_SPEC_1DEV") == "1", "MTPSpecEngine is TP-only for now"
         self.model = model
         self.mesh = model.mesh_device
         self.args = model.args

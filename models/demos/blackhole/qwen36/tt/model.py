@@ -1445,7 +1445,7 @@ class Qwen36Model:
         from models.demos.blackhole.qwen36.tt.attention.tp import KV_GROUP_WRITE_OK
         from models.demos.blackhole.qwen36.tt.gdn.tp import spec_conv_sel, spec_state_blk_idx
 
-        assert self.num_devices > 1, "traced verify is the TP path"
+        assert self.num_devices > 1 or os.environ.get("QWEN36_SPEC_1DEV") == "1", "traced verify is the TP path"  # local-ai
         assert self._paged_kv_caches is not None, "allocate_kv_caches first"
         pt = _page_table_rows(page_tables)
         B = int(pt.shape[0])

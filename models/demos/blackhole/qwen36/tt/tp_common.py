@@ -44,6 +44,11 @@ PREFILL_MAX_COLS_PORTABLE = 11
 # static CBs -- and a 2D matmul whose output block would be too big walks M in smaller blocks (`_large_m_blocking`) --
 # at S=4096 the MLP w2 CBs alone exceed L1. S <= PREFILL_L1_MAX_SEQ is unchanged.
 PREFILL_L1_MAX_SEQ = 2048
+# local-ai: override for single-P150 27B (hidden 5120, 48 GDN heads on one chip): the L1-resident S=2048 activations
+# clash with the GDN seq-scan op's static CBs, so allow pushing them to DRAM earlier (e.g. QWEN36_PREFILL_L1_MAX_SEQ=1024).
+import os as _os
+
+PREFILL_L1_MAX_SEQ = int(_os.environ.get("QWEN36_PREFILL_L1_MAX_SEQ", PREFILL_L1_MAX_SEQ))
 
 
 def prefill_act_mem(seq_len, l1_cfg=ttnn.L1_MEMORY_CONFIG):
