@@ -712,6 +712,31 @@ PERF_TEST_SCHEMAS = {
         "aliases": {},
         "test_name_aliases": {"perf_rope": "perf_rope"},
     },
+    "perf_sdpa_bcast_col_srca_srcb_reuse": {
+        "version": 1,
+        "columns": [
+            "dest_acc",
+            "formats.input_A",
+            "formats.input_B",
+            "formats.output",
+            "formats.register_A",
+            "formats.register_B",
+            "formats.sfpu_dst",
+            "formats.sfpu_src",
+            "loop_factor",
+            "marker",
+            "math_fidelity",
+            "num_faces",
+            "num_faces_A",
+            "num_faces_B",
+            "tile_cnt",
+            "unpack_to_dest",
+        ],
+        "aliases": {},
+        "test_name_aliases": {
+            "perf_sdpa_bcast_col_srca_srcb_reuse": "perf_sdpa_bcast_col_srca_srcb_reuse"
+        },
+    },
     "perf_transpose_dest": {
         "version": 5,
         "columns": [
