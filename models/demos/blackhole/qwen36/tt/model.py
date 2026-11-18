@@ -583,6 +583,10 @@ class Qwen36Model:
             nc = dict(self.args.get_norm_config("lm_head", Mode.DECODE))
             nc["output_mem_config"] = ttnn.DRAM_MEMORY_CONFIG
             return self.norm(x, mode=Mode.DECODE, norm_config=nc)
+        from models.demos.blackhole.qwen36.tt import decode_tune as _dt
+
+        if _dt.norm_shard_ok(x):  # local-ai H1: 16-core decode norm
+            return _dt.rms_norm_decode(self.norm, x, out_mc=ttnn.DRAM_MEMORY_CONFIG)  # LM head wants DRAM in0
         return self.norm(x, mode=Mode.DECODE)
 
     @classmethod
@@ -4205,6 +4209,15 @@ class Qwen36Model:
             # Bare tensor (not a tuple): the traced path passes this straight to capture_trace().
             return logits
         logits = self._forward_decode(tokens, cos, sin, current_pos, page_table)
+        if self.num_devices == 1 and os.environ.get("QWEN36_LOGITS_ROW", "1") == "1":
+            # local-ai H1: untilize on the card and keep only row 0 -> readback 0.5 MB row-major instead of
+            # a 16 MB padded tile tensor untilized on one host core (19 ms -> 5.9 ms per token).
+            rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(logits)
+            r = len(rm.shape)
+            logits = ttnn.slice(rm, [0] * r, [1] * (r - 1) + [rm.shape[-1]])
+            # rm is NOT freed: a row-major slice of the leading rows can alias its buffer (freeing it
+            # segfaulted the readback). It is a trace intermediate, 16 MB, reused every replay.
         return logits, None
 
     def process_output_decode(self, tt_out, B, S=1, is_tokens=False, is_log_probs=False):

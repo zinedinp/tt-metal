@@ -251,7 +251,8 @@ class Qwen36MLP:
             and os.environ.get("QWEN9B_MLP_DOWN_AUTO") != "1"
         ):
             down_pc = self.args.prefill_progcfg(T, hidden.shape[-1], w.w2.shape[-1])
-        output = ttnn.linear(hidden, w.w2, compute_kernel_config=ckc, memory_config=mc, program_config=down_pc)
+        from models.demos.blackhole.qwen36.tt import decode_tune as _dt  # local-ai H1: tuned decode down-proj
+        output = _dt.linear(hidden, w.w2, compute_kernel_config=ckc, memory_config=mc, program_config=down_pc)
         ttnn.deallocate(hidden)
         return output
 

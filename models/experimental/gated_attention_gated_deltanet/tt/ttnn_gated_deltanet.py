@@ -780,6 +780,7 @@ def gated_deltanet_forward_ttnn(
     o = ttnn.reshape(o, [B, T, num_v_heads * head_v_dim], memory_config=mc)
     if mc is not None:
         o = ttnn.to_memory_config(o, mc)
-    o = ttnn.linear(o, o_proj_weight, memory_config=mc, compute_kernel_config=ckc)
+    from models.demos.blackhole.qwen36.tt import decode_tune as _dt  # local-ai H1
+    o = _dt.linear(o, o_proj_weight, memory_config=mc, compute_kernel_config=ckc)
 
     return o, new_state, new_conv_q, new_conv_k, new_conv_v, new_fused_conv_state

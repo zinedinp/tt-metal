@@ -571,6 +571,7 @@ def gated_attention_forward_ttnn(
     ttnn.deallocate(gate)
 
     # Output projection
-    attn_output = ttnn.linear(attn_output, o_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
+    from models.demos.blackhole.qwen36.tt import decode_tune as _dt  # local-ai H1
+    attn_output = _dt.linear(attn_output, o_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
 
     return attn_output, new_key, new_value

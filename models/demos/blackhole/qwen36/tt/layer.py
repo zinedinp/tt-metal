@@ -8,6 +8,7 @@ based on the layer index. Both share the same RMSNorm + residual pattern and MLP
 
 import ttnn
 from models.common.rmsnorm import RMSNorm
+from models.demos.blackhole.qwen36.tt import decode_tune as _dt
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
 from models.demos.blackhole.qwen36.tt.attention import AttentionConfig, Qwen36GatedAttention
 from models.demos.blackhole.qwen36.tt.gdn import GDNConfig, Qwen36GatedDeltaNet
@@ -281,7 +282,10 @@ class Qwen36DecoderLayer:
             _attn_norm_config = _ff_norm_config = (
                 {"output_mem_config": ttnn.L1_MEMORY_CONFIG} if mode == "decode" else None
             )
-        attn_input = self.attention_norm(x, mode=_norm_mode, norm_config=_attn_norm_config)
+        if self.num_devices == 1 and _norm_mode == Mode.DECODE and _dt.norm_shard_ok(x):
+            attn_input = _dt.rms_norm_decode(self.attention_norm, x)  # local-ai H1: 16-core decode norm
+        else:
+            attn_input = self.attention_norm(x, mode=_norm_mode, norm_config=_attn_norm_config)
 
         if self.num_devices > 1:
             # TP modules: input is the gathered (full-dim) norm output [1,1,B/S,dim];
@@ -380,7 +384,10 @@ class Qwen36DecoderLayer:
         h = ttnn.add(x, attn_output)
         ttnn.deallocate(attn_output)
 
-        ff_input = self.ffn_norm(h, mode=_norm_mode, norm_config=_ff_norm_config)
+        if self.num_devices == 1 and _norm_mode == Mode.DECODE and _dt.norm_shard_ok(h):
+            ff_input = _dt.rms_norm_decode(self.ffn_norm, h)  # local-ai H1
+        else:
+            ff_input = self.ffn_norm(h, mode=_norm_mode, norm_config=_ff_norm_config)
 
         ff_output = self.feed_forward.forward(ff_input, mode=mode)
         ttnn.deallocate(ff_input)
