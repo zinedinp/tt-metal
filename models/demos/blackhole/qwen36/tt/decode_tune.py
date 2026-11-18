@@ -14,6 +14,8 @@ import ttnn
 
 _MM = os.environ.get("QWEN36_MM_TUNE", "1") == "1"
 _NORM = os.environ.get("QWEN36_NORM_SHARD", "1") == "1"
+# H3: fused GDN decode kernel (tt/gdn/fused_decode.py); needs the FP32 recurrent state.
+GDN_FUSED = os.environ.get("QWEN36_GDN_FUSED", "1") == "1"
 
 # (K, N, weight dtype or None for any) -> cores of the 1D decode grid (11 wide on P150)
 _TABLE = {

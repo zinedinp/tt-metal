@@ -82,6 +82,8 @@ def recurrent_forward(gdn, x, mode="recurrent", chunk_size=None, valid_len=None)
     if new_state is not gdn.recurrent_state:
         if list(new_state.shape) != list(gdn.recurrent_state.shape):
             new_state = ttnn.reshape(new_state, list(gdn.recurrent_state.shape))
+        if new_state.dtype != gdn.recurrent_state.dtype:  # local-ai H3: FP32 state, BF16 prefill output
+            new_state = ttnn.typecast(new_state, gdn.recurrent_state.dtype)
         ttnn.copy(new_state, gdn.recurrent_state)
         ttnn.deallocate(new_state)
     if new_fused_conv is not gdn.fused_conv_state:

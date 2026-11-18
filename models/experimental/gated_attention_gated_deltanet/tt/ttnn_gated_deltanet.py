@@ -435,6 +435,17 @@ def gated_deltanet_forward_ttnn(
         and q_dim is not None
     )
 
+    # local-ai H3: one fused device program for the whole decode recurrence (FP32 state, in place).
+    from models.demos.blackhole.qwen36.tt import decode_tune as _dt_h3
+
+    _fused_dec = (
+        _dt_h3.GDN_FUSED
+        and use_fused_conv
+        and use_inplace_state
+        and recurrent_state is not None
+        and recurrent_state.dtype == ttnn.float32
+    )
+
     if use_mega_fused:
         mega_out = ttnn.linear(hidden_states, mega_fused_weight, memory_config=mc, compute_kernel_config=ckc)
         # Split QKV | a | b | g
@@ -527,14 +538,18 @@ def gated_deltanet_forward_ttnn(
             weight_taps=fused_conv_weight_taps,
             bias_dev=fused_conv_bias_dev,
         )
-        # Split after conv
-        q = qkv[:, :, :q_dim]
-        k = qkv[:, :, q_dim : q_dim + k_dim]
-        v = qkv[:, :, q_dim + k_dim :]
-        q = ttnn.to_layout(q, ttnn.TILE_LAYOUT)
-        k = ttnn.to_layout(k, ttnn.TILE_LAYOUT)
-        v = ttnn.to_layout(v, ttnn.TILE_LAYOUT)
-        ttnn.deallocate(qkv)
+        if _fused_dec:
+            # local-ai H3: the fused kernel reads q/k/v straight out of this row.
+            qkv_row, q, k, v = qkv, None, None, None
+        else:
+            # Split after conv
+            q = qkv[:, :, :q_dim]
+            k = qkv[:, :, q_dim : q_dim + k_dim]
+            v = qkv[:, :, q_dim + k_dim :]
+            q = ttnn.to_layout(q, ttnn.TILE_LAYOUT)
+            k = ttnn.to_layout(k, ttnn.TILE_LAYOUT)
+            v = ttnn.to_layout(v, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(qkv)
         new_conv_q = None
         new_conv_k = None
         new_conv_v = None
@@ -662,12 +677,13 @@ def gated_deltanet_forward_ttnn(
         )
 
     # Reshape to heads (explicit mc keeps decode in L1)
-    q = ttnn.reshape(q, [B, T, num_heads, head_k_dim], memory_config=mc)
-    k = ttnn.reshape(k, [B, T, num_heads, head_k_dim], memory_config=mc)
-    v = ttnn.reshape(v, [B, T, num_v_heads, head_v_dim], memory_config=mc)
+    if not _fused_dec:
+        q = ttnn.reshape(q, [B, T, num_heads, head_k_dim], memory_config=mc)
+        k = ttnn.reshape(k, [B, T, num_heads, head_k_dim], memory_config=mc)
+        v = ttnn.reshape(v, [B, T, num_v_heads, head_v_dim], memory_config=mc)
 
     # GVA: repeat q,k
-    if num_v_heads > num_heads:
+    if num_v_heads > num_heads and not _fused_dec:
         repeats = num_v_heads // num_heads
         q = ttnn.repeat_interleave(q, repeats, dim=2)
         k = ttnn.repeat_interleave(k, repeats, dim=2)
@@ -732,6 +748,28 @@ def gated_deltanet_forward_ttnn(
             cached_masks=chunk_seq_masks,
             valid_len=valid_len,
         )
+    elif _fused_dec:
+        from models.demos.blackhole.qwen36.tt.gdn.fused_decode import gdn_decode_fused
+
+        f32 = ttnn.float32
+        _tc = lambda t_: t_ if t_.dtype == f32 else ttnn.typecast(t_, f32, memory_config=ttnn.L1_MEMORY_CONFIG)
+        qkv32 = _tc(qkv_row)
+        decay32 = ttnn.exp(_tc(g), memory_config=ttnn.L1_MEMORY_CONFIG)
+        beta32 = _tc(beta)
+        o = ttnn.empty(
+            [B, 1, num_v_heads, head_v_dim], dtype=f32, layout=ttnn.TILE_LAYOUT, device=device,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        gdn_decode_fused(
+            qkv32, decay32, beta32, recurrent_state, o, num_k_heads=num_heads, num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim, head_v_dim=head_v_dim,
+        )
+        for t_ in {id(x_): x_ for x_ in (qkv32, decay32, beta32, qkv_row)}.values():
+            ttnn.deallocate(t_)
+        # Downstream (gated RMSNorm, o_proj) stays exactly as on the composite path: BF16 o.
+        o32, o = o, ttnn.typecast(o, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(o32)
+        new_state = recurrent_state
     elif T == 1:
         if use_inplace_state and recurrent_state is not None:
             o, new_state = recurrent_gated_delta_rule_decode_inplace_ttnn(

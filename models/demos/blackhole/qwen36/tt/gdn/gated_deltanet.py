@@ -55,10 +55,10 @@ class Qwen36GatedDeltaNet:
         self.weights = load_gdn_weights(mesh_device, config, state_dict, tensor_cache_path)
 
         # Persistent B=1 state, updated in place so trace-baked addresses stay valid.
-        def zeros(shape):
+        def zeros(shape, dtype=ttnn.bfloat16):
             return ttnn.zeros(
                 shape,
-                dtype=ttnn.bfloat16,
+                dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=mesh_device,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -66,9 +66,13 @@ class Qwen36GatedDeltaNet:
 
         rec_shape = [1, self.num_v_heads, self.head_k_dim, self.head_v_dim]
         conv_shape = [1, self.conv_kernel_size - 1, config.q_dim + config.k_dim + config.v_dim]
-        self.recurrent_state = zeros(rec_shape)
+        # local-ai H3: the fused decode kernel keeps the recurrent state in FP32 (+75 MB over 48 layers).
+        from models.demos.blackhole.qwen36.tt import decode_tune as _dt
+
+        rec_dtype = ttnn.float32 if _dt.GDN_FUSED else ttnn.bfloat16
+        self.recurrent_state = zeros(rec_shape, rec_dtype)
         self.fused_conv_state = zeros(conv_shape)
-        self._zero_recurrent = zeros(rec_shape)
+        self._zero_recurrent = zeros(rec_shape, rec_dtype)
         self._zero_conv = zeros(conv_shape)
 
     def forward(self, x, mode="recurrent", chunk_size=None, valid_len=None):
