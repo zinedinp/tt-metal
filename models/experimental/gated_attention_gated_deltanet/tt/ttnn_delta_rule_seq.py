@@ -125,6 +125,9 @@ def chunk_gated_delta_rule_seq_adapter(
 
     # L2-norm q/k (kernel doesn't); deferred for flat inputs via _defer_l2.
     if not _defer_l2:
+        if _os.environ.get("QWEN_GDN_L2_FP32") == "1":  # local-ai: L2 in FP32 (PROTOKOLL 92)
+            q = ttnn.typecast(q, ttnn.float32) if q.dtype != ttnn.float32 else q
+            k = ttnn.typecast(k, ttnn.float32) if k.dtype != ttnn.float32 else k
         q = l2_norm_ttnn(q, dim=-1)
         k = l2_norm_ttnn(k, dim=-1)
 
@@ -140,6 +143,10 @@ def chunk_gated_delta_rule_seq_adapter(
         t = ttnn.reshape(t, [B, T, Hh, D])  # head-split (no-op if already 4D)
         t = ttnn.permute(t, (0, 2, 1, 3))
         t = ttnn.reshape(t, [B * Hh, T, D])
+        if l2 and _os.environ.get("QWEN_GDN_L2_FP32") == "1":
+            # local-ai (PROTOKOLL 92): erst FP32, dann L2-Norm (codeki-ref: Delta-Regel weicht 6,8 % ab, BF16-L2 im Verdacht).
+            t = _tilize_f32(t)
+            return l2_norm_ttnn(t, dim=-1)
         if l2:
             # Per-head L2 on [BH,T,D] bf16 (before the fp32 cast) — bit-identical to pre-split norm,
             # so keep tilize/typecast separate here (fused f32 tilize would norm in fp32 instead).
@@ -536,7 +543,12 @@ def chunk_gated_delta_rule_seq(
     # a single 2D [batch,C]@[C,C] matmul, which spreads the batch rows across ~24 cores. Same
     # math, same HiFi4/fp32 fidelity — pure parallelization win.
     triu_ones_2d = ttnn.reshape(triu_ones, [chunk_size, chunk_size], memory_config=None)
-    decay = ttnn.matmul(g_c, triu_ones_2d, memory_config=None, compute_kernel_config=_hifi_cfg)
+    if _os.environ.get("QWEN_GDN_CUMSUM") == "1":
+        # local-ai (PROTOKOLL 92): Präfixsumme als echte FP32-Addition statt Matmul. Die Matrixeinheit rundet
+        # FP32-Eingänge auf ~TF32 (10 Bit Mantisse) → Fehler in Σg, über exp(Σg_i − Σg_j) verstärkt (Delta-Regel 7 %).
+        decay = ttnn.cumsum(g_c, dim=-1)
+    else:
+        decay = ttnn.matmul(g_c, triu_ones_2d, memory_config=None, compute_kernel_config=_hifi_cfg)
     decay_offset = decay[:, 0:1]
     decay_raw = decay
     decay = ttnn.subtract(decay_raw, decay_offset, memory_config=None)

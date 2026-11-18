@@ -37,6 +37,9 @@ LAYERS = range(int(_lo), int(_hi or _lo) + 1)
 OUT = Path(os.environ.get("LD_OUT", str(QA_DIR / f"layerdiff-{TAG}.json")))
 # LD_DUMP=<Ordner>: je Schicht L<i>.safetensors (Karte + torch-Wahrheit) für codeki-ref schreiben.
 DUMP = Path(os.environ["LD_DUMP"]) if os.environ.get("LD_DUMP") else None
+# LD_STAGES=1: jeden ttnn.linear-Aufruf der Schicht mit Ein-/Ausgabe mitschneiden (lin<j>_in/_out im Dump),
+# damit codeki-ref Matmul-Fehler und DeltaNet-Kern-Fehler getrennt messen kann.
+STAGES = os.environ.get("LD_STAGES") == "1"
 PREFIX = "model.language_model."
 
 
@@ -138,7 +141,48 @@ def test_layerdiff(mesh_device):
 
             layer.attention.forward, layer.feed_forward.forward = wa, wf
             x_in = _host(x, H)
-        y = layer.forward(x, cos=cos, sin=sin, mode="prefill")
+        lins = []
+        core_rec = {}
+        if STAGES and i in LAYERS:
+            _orig_linear = ttnn.linear
+
+            def _rec_linear(a, b, *args, _o=_orig_linear, **kw):
+                o = _o(a, b, *args, **kw)
+                ta, to = ttnn.to_torch(a).float(), ttnn.to_torch(o).float()
+                lins.append((ta.reshape(-1, ta.shape[-1])[:T].clone(), to.reshape(-1, to.shape[-1])[:T].clone(),
+                             str(kw.get("activation") or "")))
+                return o
+
+            ttnn.linear = _rec_linear
+            # DeltaNet-Kern: Eingänge/Ausgang des Delta-Regel-Adapters und der Gated Norm mitschneiden.
+            import models.experimental.gated_attention_gated_deltanet.tt.ttnn_gated_deltanet as _gm
+
+            _orig_ad, _orig_ng = _gm.chunk_gated_delta_rule_seq_adapter, _gm.rms_norm_gated_ttnn
+
+            def _flat(t_):
+                tt_ = ttnn.to_torch(t_).float()
+                return tt_.reshape(T, -1).clone() if tt_.numel() % T == 0 else tt_.flatten().clone()
+
+            def _rec_ad(*a, **kw):
+                o_ = _orig_ad(*a, **kw)
+                for nm in ("q", "k", "v", "beta", "g"):
+                    core_rec[f"d_{nm}"] = _flat(kw[nm])
+                core_rec["d_o"] = _flat(o_[0])
+                return o_
+
+            def _rec_ng(x_, gate_, *a, **kw):
+                o_ = _orig_ng(x_, gate_, *a, **kw)
+                core_rec["n_x"], core_rec["n_gate"], core_rec["n_out"] = _flat(x_), _flat(gate_), _flat(o_)
+                return o_
+
+            _gm.chunk_gated_delta_rule_seq_adapter, _gm.rms_norm_gated_ttnn = _rec_ad, _rec_ng
+            try:
+                y = layer.forward(x, cos=cos, sin=sin, mode="prefill")
+            finally:
+                ttnn.linear = _orig_linear
+                _gm.chunk_gated_delta_rule_seq_adapter, _gm.rms_norm_gated_ttnn = _orig_ad, _orig_ng
+        else:
+            y = layer.forward(x, cos=cos, sin=sin, mode="prefill")
         if i not in LAYERS:
             x = y
             continue
@@ -172,8 +216,16 @@ def test_layerdiff(mesh_device):
         if DUMP is not None:
             # Für codeki-ref (Rust-Referenz): Karteneingabe/-ausgaben + torch-Wahrheit, FP32, [T, H].
             DUMP.mkdir(parents=True, exist_ok=True)
+            stages = {}
+            meta_lin = []
+            for j, (li, lo, act) in enumerate(lins):
+                stages[f"lin{j}_in"] = li.contiguous()
+                stages[f"lin{j}_out"] = lo.contiguous()
+                meta_lin.append(act)
+            stages.update({k_: v_.contiguous() for k_, v_ in core_rec.items()})
             save_file(
                 {
+                    **stages,
                     "x_in": x_in.contiguous(),
                     "h_mid": h_mid.contiguous(),
                     "x_out": x_out.contiguous(),
@@ -184,7 +236,7 @@ def test_layerdiff(mesh_device):
                     "ids": ids[0].to(torch.int32).contiguous(),
                 },
                 str(DUMP / f"L{i:02d}.safetensors"),
-                metadata={"kind": kind, "layer": str(i), "T": str(T)},
+                metadata={"kind": kind, "layer": str(i), "T": str(T), "lin_act": ",".join(meta_lin), "n_lin": str(len(lins))},
             )
         mx, ml = r.get("mixer", {}), r.get("mlp", {})
         logger.info(

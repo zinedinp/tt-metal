@@ -693,11 +693,27 @@ def gated_deltanet_forward_ttnn(
         a = ttnn.linear(hidden_states, a_proj_weight, memory_config=mc, compute_kernel_config=ckc)
     if allow_neg_eigval:
         beta = ttnn.multiply(beta, 2.0, memory_config=mc)
-    a_biased = ttnn.add(a, dt_bias, memory_config=mc)
-    sp = ttnn.softplus(a_biased, memory_config=mc)
-    if A_neg_precomputed is not None:
+    if _os_l1.environ.get("QWEN_GDN_G_FP32") == "1" and A_log is not None:
+        # local-ai (PROTOKOLL 92): g = −exp(A_log)·softplus(a + dt_bias) in FP32 mit stabiler Formel
+        # softplus(x) = relu(x) + log1p(exp(−|x|)). Die BF16-Kette mit ttnn.softplus wich um bis 0,22 ab, was über
+        # exp(g) als Zerfallsfaktor 10 % Fehler am Ausgang der Delta-Regel verursachte (codeki-ref stages).
+        f32 = ttnn.float32
+        _tc = lambda t_: t_ if t_.dtype == f32 else ttnn.typecast(t_, f32)
+        x32 = ttnn.add(_tc(a), _tc(dt_bias), memory_config=mc)
+        sp = ttnn.add(
+            ttnn.relu(x32, memory_config=mc),
+            ttnn.log1p(ttnn.exp(ttnn.neg(ttnn.abs(x32, memory_config=mc), memory_config=mc), memory_config=mc), memory_config=mc),
+            memory_config=mc,
+        )
+        A_neg32 = ttnn.neg(ttnn.exp(_tc(A_log), memory_config=mc), memory_config=mc)
+        g = ttnn.multiply(A_neg32, sp, memory_config=mc)
+    elif A_neg_precomputed is not None:
+        a_biased = ttnn.add(a, dt_bias, memory_config=mc)
+        sp = ttnn.softplus(a_biased, memory_config=mc)
         g = ttnn.multiply(A_neg_precomputed, sp, memory_config=mc)
     else:
+        a_biased = ttnn.add(a, dt_bias, memory_config=mc)
+        sp = ttnn.softplus(a_biased, memory_config=mc)
         A = ttnn.exp(A_log, memory_config=mc)
         A_neg = ttnn.neg(A, memory_config=mc)
         g = ttnn.multiply(A_neg, sp, memory_config=mc)
