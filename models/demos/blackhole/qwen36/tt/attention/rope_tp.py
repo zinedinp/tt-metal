@@ -13,23 +13,24 @@ import torch
 
 import ttnn
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
+from models.demos.blackhole.qwen36.tt.rope import rope_inv_freq, rope_mscale
 
 
 def build_rope_tables(device, rope_dim, max_seq_len, theta):
     """Precompute replicated cos/sin tables [1, max_seq_len, rope_dim] (HF split-halves)."""
-    inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
+    inv_freq = rope_inv_freq(rope_dim, theta)
     t = torch.arange(max_seq_len, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
     emb = torch.cat([freqs, freqs], dim=-1)  # [max_seq_len, rope_dim]
     cos = ttnn.from_torch(
-        emb.cos().unsqueeze(0).to(torch.bfloat16),
+        (emb.cos() * rope_mscale()).unsqueeze(0).to(torch.bfloat16),
         dtype=ttnn.bfloat16,
         layout=ttnn.TILE_LAYOUT,
         device=device,
         mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
     sin = ttnn.from_torch(
-        emb.sin().unsqueeze(0).to(torch.bfloat16),
+        (emb.sin() * rope_mscale()).unsqueeze(0).to(torch.bfloat16),
         dtype=ttnn.bfloat16,
         layout=ttnn.TILE_LAYOUT,
         device=device,
@@ -256,13 +257,13 @@ def rot_mats_decode(device, rope_dim, max_seq_len, theta, positions):
     positions: torch.Tensor [B] of int positions. Built on host (small) then
     replicated to the mesh — matches apply_partial_rope_decode's expected layout.
     """
-    inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
+    inv_freq = rope_inv_freq(rope_dim, theta)
     pos = positions.float()
     freqs = torch.outer(pos, inv_freq)  # [B, rope_dim/2]
     emb = torch.cat([freqs, freqs], dim=-1)  # [B, rope_dim]
     B = positions.shape[0]
-    cos = emb.cos().reshape(1, B, 1, rope_dim).to(torch.bfloat16)
-    sin = emb.sin().reshape(1, B, 1, rope_dim).to(torch.bfloat16)
+    cos = (emb.cos() * rope_mscale()).reshape(1, B, 1, rope_dim).to(torch.bfloat16)
+    sin = (emb.sin() * rope_mscale()).reshape(1, B, 1, rope_dim).to(torch.bfloat16)
     cos_tt = ttnn.from_torch(
         cos, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device)
     )
@@ -280,7 +281,7 @@ def rot_mats_prefill(device, rope_dim, seq_len, theta, position_ids=None, mrope_
     where interleaved-mrope collapses to ordinary 1D RoPE, so the result is independent of
     mrope_section and identical to the pre-M-RoPE behaviour.
     """
-    inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
+    inv_freq = rope_inv_freq(rope_dim, theta)
     if position_ids is None:
         position_ids = torch.arange(seq_len).view(1, -1)
     if mrope_section is None:
@@ -288,7 +289,7 @@ def rot_mats_prefill(device, rope_dim, seq_len, theta, position_ids=None, mrope_
         half = rope_dim // 2
         base = half // 3
         mrope_section = [base, base, half - 2 * base]
-    cos, sin = get_rot_mats(inv_freq, position_ids, mrope_section, attention_scaling)
+    cos, sin = get_rot_mats(inv_freq, position_ids, mrope_section, attention_scaling * rope_mscale())
     cos = ttnn.from_torch(
         cos.reshape(1, 1, seq_len, rope_dim).to(torch.bfloat16),
         dtype=ttnn.bfloat16,

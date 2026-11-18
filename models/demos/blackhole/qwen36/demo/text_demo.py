@@ -256,7 +256,7 @@ def _warmup_prefill(model, device, token_ids):
 BLOCK_SIZE = 64
 PREFILL_CHUNK = 2048
 # 256k ceiling (4096×64 tokens); _blocks_for sizes the cache per seqlen so short tests stay cheap.
-MAX_BLOCK_BUDGET = 4096
+MAX_BLOCK_BUDGET = int(os.environ.get("QWEN36_MAX_BLOCKS", "4096"))  # local-ai: 8256 for 512K (+YaRN)
 
 
 def _blocks_for(seqlen, max_generated_tokens):

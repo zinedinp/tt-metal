@@ -96,7 +96,7 @@ def _build_session(tokenizer, target_tokens):
 @pytest.mark.parametrize("mesh_device", [_MESH_SHAPE], indirect=True)
 @pytest.mark.parametrize("device_params", DEVICE_PARAMS, indirect=True)
 @pytest.mark.parametrize("target", LENGTHS, ids=[f"ctx{n // 1024}k" for n in LENGTHS])
-@pytest.mark.timeout(7200)
+@pytest.mark.timeout(int(os.environ.get("LONGSESSION_TIMEOUT", "7200")))
 def test_long_session(mesh_device, target):
     from transformers import AutoTokenizer
 
@@ -113,6 +113,8 @@ def test_long_session(mesh_device, target):
     token_ids, turns = _build_session(tokenizer, target)
     T = token_ids.shape[1]
     kv = "bf8" if os.environ.get("QWEN_SDPA_BF8") == "1" else "bf16"
+    if os.environ.get("QWEN_KV_K") or os.environ.get("QWEN_KV_V"):
+        kv = f"k{os.environ.get('QWEN_KV_K', kv)}/v{os.environ.get('QWEN_KV_V', kv)}"
     logger.info(f"Session: {T} tokens, {turns} filler turns, KV {kv}, budget {num_blocks}x{BLOCK_SIZE}={max_seq_len}")
 
     generated, perf = _run_traced_generation(model, tokenizer, device, token_ids, MAX_NEW, num_blocks)

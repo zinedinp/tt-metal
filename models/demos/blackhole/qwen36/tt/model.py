@@ -18,6 +18,7 @@ import ttnn
 from models.common.rmsnorm import RMSNorm
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
 from models.demos.blackhole.qwen36.tt.layer import Qwen36DecoderLayer
+from models.demos.blackhole.qwen36.tt.rope import rope_inv_freq, rope_mscale
 from models.demos.blackhole.qwen36.tt.model_config import Qwen36ModelArgs
 from models.demos.blackhole.qwen36.tt.rope import Qwen36RoPESetup
 from models.tt_transformers.tt.common import Mode, get_block_size, num_blocks_in_seq
@@ -102,14 +103,19 @@ class Qwen36Model:
 
         # Framework Embedding (mesh-aware; replicates on 1-device mesh).
         from models.tt_transformers.tt.embedding import Embedding
+        from models.demos.blackhole.qwen36.tt.host_embedding import HostEmbedding, host_embed_enabled
 
-        self.embd = Embedding(
-            mesh_device=mesh_device,
-            args=args,
-            weight_cache_path=tensor_cache_path,
-            state_dict=state_dict,
-            dtype=ttnn.bfloat16,
-        )
+        if host_embed_enabled(args):
+            # local-ai L1a: table stays in host RAM (−2.54 GB on the card), rows uploaded per call.
+            self.embd = HostEmbedding(mesh_device, args, state_dict)
+        else:
+            self.embd = Embedding(
+                mesh_device=mesh_device,
+                args=args,
+                weight_cache_path=tensor_cache_path,
+                state_dict=state_dict,
+                dtype=ttnn.bfloat16,
+            )
 
         # RoPE setup (for gated attention layers only)
         self.rope = Qwen36RoPESetup(mesh_device, args)
@@ -1267,11 +1273,11 @@ class Qwen36Model:
         # RoPE position is the KV position offset by rope_delta (0 for text); same as decode.
         rope_pos_vec = pos_vec + self.rope.rope_delta
         B = rope_pos_vec.shape[0]
-        inv_freq = 1.0 / (self.args.rope_theta ** (torch.arange(0, rd, 2).float() / rd))
+        inv_freq = rope_inv_freq(rd, self.args.rope_theta)
         freqs = torch.outer(rope_pos_vec.float(), inv_freq)  # [B, rd/2], per-row rotation
         emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos().reshape(1, B, 1, rd).to(torch.bfloat16)
-        sin = emb.sin().reshape(1, B, 1, rd).to(torch.bfloat16)
+        cos = (emb.cos() * rope_mscale()).reshape(1, B, 1, rd).to(torch.bfloat16)
+        sin = (emb.sin() * rope_mscale()).reshape(1, B, 1, rd).to(torch.bfloat16)
         return cos, sin
 
     def _spec_tail(self, x):
@@ -3618,11 +3624,27 @@ class Qwen36Model:
         if self.num_devices > 1:
             return self._allocate_kv_caches_tp(kv_cache_shape, dtype, batch_size)
 
+        # local-ai (Phase L2): K and V format chosen separately, optionally per attention layer.
+        #   QWEN_KV_K / QWEN_KV_V = bf16 | bf8 | bf4 (default: dtype above)
+        #   QWEN_KV_LAYERS="<layer>:<k>/<v>,..." overrides single attention layers, e.g. "3:bf8/bf8".
+        # paged_fill_cache input is cast to each cache's own dtype (ttnn_gated_attention), and
+        # paged_update_cache / SDPA accept bf16/bf8/bf4 per tensor, so mixed formats need nothing else.
+        _kvfmt = {"bf16": ttnn.bfloat16, "bf8": ttnn.bfloat8_b, "bf4": ttnn.bfloat4_b}
+        k_dt = _kvfmt[os.environ.get("QWEN_KV_K", "")] if os.environ.get("QWEN_KV_K") else dtype
+        v_dt = _kvfmt[os.environ.get("QWEN_KV_V", "")] if os.environ.get("QWEN_KV_V") else dtype
+        per_layer = {}
+        for item in filter(None, os.environ.get("QWEN_KV_LAYERS", "").split(",")):
+            li, kv = item.split(":")
+            kf, vf = kv.split("/")
+            per_layer[int(li)] = (_kvfmt[kf], _kvfmt[vf])
+
         kv_caches = []
         for idx in self._attention_layer_indices:
-            k_cache = ttnn.zeros(kv_cache_shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
-            v_cache = ttnn.zeros(kv_cache_shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+            kd, vd = per_layer.get(idx, (k_dt, v_dt))
+            k_cache = ttnn.zeros(kv_cache_shape, dtype=kd, layout=ttnn.TILE_LAYOUT, device=self.device)
+            v_cache = ttnn.zeros(kv_cache_shape, dtype=vd, layout=ttnn.TILE_LAYOUT, device=self.device)
             kv_caches.append([k_cache, v_cache])
+        logger.info(f"[KV] K {k_dt} V {v_dt}, per-layer overrides {per_layer or '-'}, shape {kv_cache_shape}")
         self.set_paged_kv_caches(kv_caches)
         self._allocate_mtp_kv_cache(kv_cache_shape, dtype, batch_size, replicate=False)
         return kv_caches
@@ -4130,11 +4152,11 @@ class Qwen36Model:
         if self.num_devices > 1:
             # TP: rope_tp cos/sin [1,B,1,rope_dim] packed on host.
             rd = self.args.rope_head_dim
-            inv_freq = 1.0 / (self.args.rope_theta ** (torch.arange(0, rd, 2).float() / rd))
+            inv_freq = rope_inv_freq(rd, self.args.rope_theta)
             freqs = torch.outer(rope_pos_vec.float(), inv_freq)  # [B, rd/2], per-user rotation
             emb = torch.cat([freqs, freqs], dim=-1)
-            cos = emb.cos().reshape(1, B, 1, rd).to(torch.bfloat16)
-            sin = emb.sin().reshape(1, B, 1, rd).to(torch.bfloat16)
+            cos = (emb.cos() * rope_mscale()).reshape(1, B, 1, rd).to(torch.bfloat16)
+            sin = (emb.sin() * rope_mscale()).reshape(1, B, 1, rd).to(torch.bfloat16)
             rope_packed = ttnn.from_torch(torch.cat([cos, sin], dim=0), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
         else:
             # Single-device decode is B=1 in this port; per-user single-device rope is out of scope.
